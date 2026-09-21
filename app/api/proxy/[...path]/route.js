@@ -7,29 +7,6 @@ const DEFAULT_UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
     '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-/*
-|--------------------------------------------------------------------------
-| Allowed upstream hosts
-|--------------------------------------------------------------------------
-| IMPORTANT:
-| Restrict this to domains you control.
-|
-| Example:
-| const ALLOWED_HOSTS = new Set([
-|     'media.example.com',
-|     'cdn.example.com',
-| ]);
-|
-| If you intentionally want to proxy arbitrary URLs, replace the
-| allowlist check with your own access-control mechanism.
-|--------------------------------------------------------------------------
-*/
-
-const ALLOWED_HOSTS = new Set([
-    'your-domain.com',
-    'cdn.your-domain.com',
-]);
-
 function getTargetFromPath(req) {
     const pathname = req.nextUrl.pathname;
     const prefix = '/api/proxy/';
@@ -54,13 +31,7 @@ function getTargetFromPath(req) {
     }
 
     /*
-     * Some routing setups turn:
-     *
-     * https://example.com
-     *
-     * into:
-     *
-     * https:/example.com
+     * Handle malformed protocol slashes.
      */
     if (
         encodedTarget.startsWith('https:/') &&
@@ -95,9 +66,6 @@ function corsHeaders() {
 function copyResponseHeaders(upstreamHeaders) {
     const headers = new Headers();
 
-    /*
-     * Headers useful for HLS/DASH/video streaming.
-     */
     const allowedHeaders = [
         'content-type',
         'content-length',
@@ -120,9 +88,6 @@ function copyResponseHeaders(upstreamHeaders) {
         }
     }
 
-    /*
-     * Add CORS headers.
-     */
     const cors = corsHeaders();
 
     for (const [key, value] of Object.entries(cors)) {
@@ -166,7 +131,7 @@ async function handleProxy(req) {
         }
 
         /*
-         * Only HTTP/HTTPS.
+         * Only allow HTTP/HTTPS protocols for safety.
          */
         if (
             targetUrl.protocol !== 'http:' &&
@@ -184,24 +149,6 @@ async function handleProxy(req) {
         }
 
         /*
-         * Security: restrict proxy targets.
-         *
-         * Add your actual CDN/stream domains to ALLOWED_HOSTS.
-         */
-        if (!ALLOWED_HOSTS.has(targetUrl.hostname)) {
-            return NextResponse.json(
-                {
-                    error: 'Target host is not allowed',
-                    host: targetUrl.hostname,
-                },
-                {
-                    status: 403,
-                    headers: corsHeaders(),
-                }
-            );
-        }
-
-        /*
          * Request headers sent to upstream server.
          */
         const upstreamHeaders = new Headers();
@@ -213,25 +160,16 @@ async function handleProxy(req) {
             req.headers.get('referer') ||
             `${targetUrl.origin}/`;
 
-        /*
-         * Basic browser-like headers.
-         */
         upstreamHeaders.set('User-Agent', userAgent);
         upstreamHeaders.set('Accept', '*/*');
         upstreamHeaders.set('Referer', referer);
 
-        /*
-         * Forward Origin only when supplied by client.
-         */
         const origin = req.headers.get('origin');
 
         if (origin) {
             upstreamHeaders.set('Origin', origin);
         }
 
-        /*
-         * Critical for video seeking / DASH / HLS segments.
-         */
         const range = req.headers.get('range');
 
         if (range) {
@@ -244,47 +182,25 @@ async function handleProxy(req) {
             upstreamHeaders.set('Accept', accept);
         }
 
-        /*
-         * Forward content type for POST/PUT requests.
-         */
         const contentType = req.headers.get('content-type');
 
         if (contentType) {
             upstreamHeaders.set('Content-Type', contentType);
         }
 
-        /*
-         * Authorization can be useful for streams you control.
-         */
         const authorization = req.headers.get('authorization');
 
         if (authorization) {
             upstreamHeaders.set('Authorization', authorization);
         }
 
-        /*
-         * Do not forward Host manually.
-         * fetch() sets it for the target URL.
-         */
-
         const fetchOptions = {
             method: req.method,
             headers: upstreamHeaders,
-
-            /*
-             * Follow upstream redirects.
-             */
             redirect: 'follow',
-
-            /*
-             * Do not cache the proxied response by Next.js.
-             */
             cache: 'no-store',
         };
 
-        /*
-         * Forward request body for methods that have one.
-         */
         if (
             req.method !== 'GET' &&
             req.method !== 'HEAD' &&
@@ -302,9 +218,6 @@ async function handleProxy(req) {
             upstreamResponse.headers
         );
 
-        /*
-         * Return upstream status and streaming body.
-         */
         return new NextResponse(
             upstreamResponse.body,
             {
@@ -333,56 +246,26 @@ async function handleProxy(req) {
     }
 }
 
-/*
-|--------------------------------------------------------------------------
-| GET
-|--------------------------------------------------------------------------
-*/
 export async function GET(req) {
     return handleProxy(req);
 }
 
-/*
-|--------------------------------------------------------------------------
-| HEAD
-|--------------------------------------------------------------------------
-*/
 export async function HEAD(req) {
     return handleProxy(req);
 }
 
-/*
-|--------------------------------------------------------------------------
-| POST
-|--------------------------------------------------------------------------
-*/
 export async function POST(req) {
     return handleProxy(req);
 }
 
-/*
-|--------------------------------------------------------------------------
-| PUT
-|--------------------------------------------------------------------------
-*/
 export async function PUT(req) {
     return handleProxy(req);
 }
 
-/*
-|--------------------------------------------------------------------------
-| DELETE
-|--------------------------------------------------------------------------
-*/
 export async function DELETE(req) {
     return handleProxy(req);
 }
 
-/*
-|--------------------------------------------------------------------------
-| OPTIONS / CORS preflight
-|--------------------------------------------------------------------------
-*/
 export async function OPTIONS() {
     return new NextResponse(null, {
         status: 204,

@@ -19,11 +19,10 @@ const DEFAULT_UA =
  */
 
 const ALLOWED_HOSTS = new Set([
-    'livestream1.sunnxt.com',
-    'livestream.sunnxt.com',
+    'your-domain.com',
+    'cdn.your-domain.com',
     'sunnxt.com',
     'livestream2.sunnxt.com',
-    '193.47.62.190',
 ]);
 
 
@@ -54,7 +53,6 @@ function corsHeaders() {
 ========================================================= */
 
 function getTargetFromPath(req) {
-
     const pathname = req.nextUrl.pathname;
     const search = req.nextUrl.search; // Capture search/query parameters (tokens, keys)
     const prefix = '/api/proxy/';
@@ -70,38 +68,23 @@ function getTargetFromPath(req) {
     }
 
     /*
-     * Decode URL-encoded target.
+     * Safely decode URL-encoded target if it contains encoded characters.
      */
-    try {
-        rawTarget = decodeURIComponent(rawTarget);
-    } catch {
-        // Keep original value.
+    if (rawTarget.includes('%')) {
+        try {
+            rawTarget = decodeURIComponent(rawTarget);
+        } catch {
+            // Keep original value if decoding fails.
+        }
     }
 
     /*
-     * Repair routing that changed:
-     * https:// into https:/
+     * Repair routing that compressed protocol slashes:
+     * https:/ into https://
      */
-
-    if (
-        rawTarget.startsWith('https:/') &&
-        !rawTarget.startsWith('https://')
-    ) {
-        rawTarget = rawTarget.replace(
-            /^https:\//,
-            'https://'
-        );
-    }
-
-    if (
-        rawTarget.startsWith('http:/') &&
-        !rawTarget.startsWith('http://')
-    ) {
-        rawTarget = rawTarget.replace(
-            /^http:\//,
-            'http://'
-        );
-    }
+    rawTarget = rawTarget
+        .replace(/^https:\/+/, 'https://')
+        .replace(/^http:\/+/, 'http://');
 
     /*
      * Append query parameters back onto the target URL
@@ -119,9 +102,7 @@ function getTargetFromPath(req) {
 ========================================================= */
 
 function isAllowedHost(hostname) {
-
     hostname = hostname.toLowerCase();
-
     return ALLOWED_HOSTS.has(hostname);
 }
 
@@ -131,40 +112,24 @@ function isAllowedHost(hostname) {
 ========================================================= */
 
 function copyResponseHeaders(upstreamHeaders) {
-
     const headers = new Headers();
 
     const allowedHeaders = [
-
         'content-type',
-
         'content-length',
-
         'content-range',
-
         'accept-ranges',
-
         'cache-control',
-
         'etag',
-
         'last-modified',
-
         'expires',
-
         'content-encoding',
-
         'content-disposition',
-
         'vary',
-
     ];
 
     for (const name of allowedHeaders) {
-
-        const value =
-            upstreamHeaders.get(name);
-
+        const value = upstreamHeaders.get(name);
         if (value) {
             headers.set(name, value);
         }
@@ -173,12 +138,8 @@ function copyResponseHeaders(upstreamHeaders) {
     /*
      * Add CORS headers.
      */
-
     const cors = corsHeaders();
-
-    for (const [key, value]
-        of Object.entries(cors)) {
-
+    for (const [key, value] of Object.entries(cors)) {
         headers.set(key, value);
     }
 
@@ -195,30 +156,17 @@ function createProxyUrl(
     baseUrl,
     proxyBaseUrl
 ) {
-
     try {
-
-        /*
-         * Convert relative URL into absolute URL.
-         */
-        const absoluteUrl =
-            new URL(
-                originalUrl,
-                baseUrl
-            ).toString();
-
-        /*
-         * Encode target so characters such as:
-         * ? & = do not break the proxy route.
-         */
+        const absoluteUrl = new URL(
+            originalUrl,
+            baseUrl
+        ).toString();
 
         return (
             proxyBaseUrl +
             encodeURIComponent(absoluteUrl)
         );
-
     } catch {
-
         return originalUrl;
     }
 }
@@ -233,63 +181,45 @@ function rewriteDashManifest(
     targetUrl,
     proxyBaseUrl
 ) {
-
-    const baseUrl =
-        new URL(
-            './',
-            targetUrl
-        ).toString();
-
+    const baseUrl = new URL(
+        './',
+        targetUrl
+    ).toString();
 
     manifest = manifest.replace(
         /\b(media|initialization|sourceURL|index|indexRange)=["']([^"']+)["']/gi,
-
         (match, attribute, value) => {
-
-            if (
-                attribute.toLowerCase() ===
-                'indexrange'
-            ) {
+            if (attribute.toLowerCase() === 'indexrange') {
                 return match;
             }
 
-            const proxied =
-                createProxyUrl(
-                    value,
-                    baseUrl,
-                    proxyBaseUrl
-                );
+            const proxied = createProxyUrl(
+                value,
+                baseUrl,
+                proxyBaseUrl
+            );
 
             return `${attribute}="${proxied}"`;
         }
     );
 
-
     manifest = manifest.replace(
         /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/gi,
-
         (match, start, value, end) => {
-
-            const trimmed =
-                value.trim();
-
+            const trimmed = value.trim();
             if (!trimmed) {
                 return match;
             }
 
-            const proxied =
-                createProxyUrl(
-                    trimmed,
-                    baseUrl,
-                    proxyBaseUrl
-                );
-
-            return (
-                `${start}${proxied}${end}`
+            const proxied = createProxyUrl(
+                trimmed,
+                baseUrl,
+                proxyBaseUrl
             );
+
+            return `${start}${proxied}${end}`;
         }
     );
-
 
     return manifest;
 }
@@ -304,41 +234,29 @@ function rewriteHlsManifest(
     targetUrl,
     proxyBaseUrl
 ) {
+    const baseUrl = new URL(
+        './',
+        targetUrl
+    ).toString();
 
-    const baseUrl =
-        new URL(
-            './',
-            targetUrl
-        ).toString();
-
-
-    const lines =
-        manifest.split(/\r?\n/);
-
+    const lines = manifest.split(/\r?\n/);
 
     const result = lines.map(line => {
-
-        const trimmed =
-            line.trim();
+        const trimmed = line.trim();
 
         if (!trimmed) {
             return line;
         }
 
         if (trimmed.startsWith('#')) {
-
             return line.replace(
                 /URI="([^"]+)"/gi,
-
                 (match, uri) => {
-
-                    const proxied =
-                        createProxyUrl(
-                            uri,
-                            baseUrl,
-                            proxyBaseUrl
-                        );
-
+                    const proxied = createProxyUrl(
+                        uri,
+                        baseUrl,
+                        proxyBaseUrl
+                    );
                     return `URI="${proxied}"`;
                 }
             );
@@ -351,7 +269,6 @@ function rewriteHlsManifest(
         );
     });
 
-
     return result.join('\n');
 }
 
@@ -360,16 +277,9 @@ function rewriteHlsManifest(
    DETECT MANIFEST
 ========================================================= */
 
-function isManifest(
-    targetUrl,
-    contentType
-) {
-
-    const pathname =
-        targetUrl.pathname.toLowerCase();
-
-    const type =
-        contentType.toLowerCase();
+function isManifest(targetUrl, contentType) {
+    const pathname = targetUrl.pathname.toLowerCase();
+    const type = contentType.toLowerCase();
 
     if (
         pathname.endsWith('.mpd') ||
@@ -397,192 +307,83 @@ function isManifest(
 ========================================================= */
 
 async function handleProxy(req) {
-
     try {
-
-        let rawTarget =
-            getTargetFromPath(req);
+        let rawTarget = getTargetFromPath(req);
 
         if (!rawTarget) {
-
             return NextResponse.json(
-                {
-                    error:
-                        'Missing target URL',
-                },
-                {
-                    status: 400,
-                    headers:
-                        corsHeaders(),
-                }
+                { error: 'Missing target URL' },
+                { status: 400, headers: corsHeaders() }
             );
         }
 
         let targetUrl;
-
         try {
-
-            targetUrl =
-                new URL(rawTarget);
-
+            targetUrl = new URL(rawTarget);
         } catch {
-
             return NextResponse.json(
-                {
-                    error:
-                        'Invalid target URL',
-
-                    target:
-                        rawTarget,
-                },
-                {
-                    status: 400,
-                    headers:
-                        corsHeaders(),
-                }
+                { error: 'Invalid target URL', target: rawTarget },
+                { status: 400, headers: corsHeaders() }
             );
         }
 
         if (
-            targetUrl.protocol !==
-                'http:' &&
-
-            targetUrl.protocol !==
-                'https:'
+            targetUrl.protocol !== 'http:' &&
+            targetUrl.protocol !== 'https:'
         ) {
-
             return NextResponse.json(
-                {
-                    error:
-                        'Only HTTP and HTTPS URLs are allowed',
-                },
-                {
-                    status: 400,
-                    headers:
-                        corsHeaders(),
-                }
+                { error: 'Only HTTP and HTTPS URLs are allowed' },
+                { status: 400, headers: corsHeaders() }
             );
         }
 
-        if (
-            !isAllowedHost(
-                targetUrl.hostname
-            )
-        ) {
-
+        if (!isAllowedHost(targetUrl.hostname)) {
             return NextResponse.json(
-                {
-                    error:
-                        'Target host is not allowed',
-
-                    host:
-                        targetUrl.hostname,
-                },
-                {
-                    status: 403,
-                    headers:
-                        corsHeaders(),
-                }
+                { error: 'Target host is not allowed', host: targetUrl.hostname },
+                { status: 403, headers: corsHeaders() }
             );
         }
 
-        const upstreamHeaders =
-            new Headers();
+        const upstreamHeaders = new Headers();
 
         const userAgent =
-            req.headers.get(
-                'user-agent'
-            ) || DEFAULT_UA;
-
-        upstreamHeaders.set(
-            'User-Agent',
-            userAgent
-        );
-
+            req.headers.get('user-agent') || DEFAULT_UA;
+        upstreamHeaders.set('User-Agent', userAgent);
         upstreamHeaders.set(
             'Accept',
-            req.headers.get(
-                'accept'
-            ) || '*/*'
+            req.headers.get('accept') || '*/*'
         );
 
         const referer =
-            req.headers.get(
-                'referer'
-            ) ||
+            req.headers.get('referer') ||
             `${targetUrl.origin}/`;
+        upstreamHeaders.set('Referer', referer);
 
-        upstreamHeaders.set(
-            'Referer',
-            referer
-        );
-
-        const origin =
-            req.headers.get(
-                'origin'
-            );
-
+        const origin = req.headers.get('origin');
         if (origin) {
-
-            upstreamHeaders.set(
-                'Origin',
-                origin
-            );
+            upstreamHeaders.set('Origin', origin);
         }
 
-        const range =
-            req.headers.get(
-                'range'
-            );
-
+        const range = req.headers.get('range');
         if (range) {
-
-            upstreamHeaders.set(
-                'Range',
-                range
-            );
+            upstreamHeaders.set('Range', range);
         }
 
-        const authorization =
-            req.headers.get(
-                'authorization'
-            );
-
+        const authorization = req.headers.get('authorization');
         if (authorization) {
-
-            upstreamHeaders.set(
-                'Authorization',
-                authorization
-            );
+            upstreamHeaders.set('Authorization', authorization);
         }
 
-        const requestContentType =
-            req.headers.get(
-                'content-type'
-            );
-
+        const requestContentType = req.headers.get('content-type');
         if (requestContentType) {
-
-            upstreamHeaders.set(
-                'Content-Type',
-                requestContentType
-            );
+            upstreamHeaders.set('Content-Type', requestContentType);
         }
 
         const fetchOptions = {
-
-            method:
-                req.method,
-
-            headers:
-                upstreamHeaders,
-
-            redirect:
-                'follow',
-
-            cache:
-                'no-store',
-
+            method: req.method,
+            headers: upstreamHeaders,
+            redirect: 'follow',
+            cache: 'no-store',
         };
 
         if (
@@ -590,68 +391,37 @@ async function handleProxy(req) {
             req.method !== 'HEAD' &&
             req.method !== 'OPTIONS'
         ) {
-
-            fetchOptions.body =
-                await req.arrayBuffer();
+            fetchOptions.body = await req.arrayBuffer();
         }
 
-        const upstreamResponse =
-            await fetch(
-                targetUrl.toString(),
-                fetchOptions
-            );
+        const upstreamResponse = await fetch(
+            targetUrl.toString(),
+            fetchOptions
+        );
 
         const contentType =
-            upstreamResponse.headers.get(
-                'content-type'
-            ) || '';
+            upstreamResponse.headers.get('content-type') || '';
 
-        const responseHeaders =
-            copyResponseHeaders(
-                upstreamResponse.headers
-            );
+        const responseHeaders = copyResponseHeaders(
+            upstreamResponse.headers
+        );
 
-        if (
-            isManifest(
-                targetUrl,
-                contentType
-            )
-        ) {
+        if (isManifest(targetUrl, contentType)) {
+            const manifestText = await upstreamResponse.text();
 
-            const manifestText =
-                await upstreamResponse.text();
-
-            const host =
-                req.headers.get(
-                    'host'
-                );
-
+            const host = req.headers.get('host');
             if (!host) {
-
                 return NextResponse.json(
-                    {
-                        error:
-                            'Unable to determine proxy host',
-                    },
-                    {
-                        status: 500,
-                        headers:
-                            corsHeaders(),
-                    }
+                    { error: 'Unable to determine proxy host' },
+                    { status: 500, headers: corsHeaders() }
                 );
             }
 
             const protocol =
-                req.headers.get(
-                    'x-forwarded-proto'
-                ) ||
-                (
-                    req.nextUrl.protocol ||
-                    'https:'
-                ).replace(':', '');
+                req.headers.get('x-forwarded-proto') ||
+                (req.nextUrl.protocol || 'https:').replace(':', '');
 
-            const proxyBaseUrl =
-                `${protocol}://${host}/api/proxy/`;
+            const proxyBaseUrl = `${protocol}://${host}/api/proxy/`;
 
             let rewrittenManifest;
 
@@ -659,100 +429,59 @@ async function handleProxy(req) {
                 targetUrl.pathname
                     .toLowerCase()
                     .endsWith('.mpd') ||
-                contentType
-                    .toLowerCase()
-                    .includes('dash+xml')
+                contentType.toLowerCase().includes('dash+xml')
             ) {
-
-                rewrittenManifest =
-                    rewriteDashManifest(
-                        manifestText,
-                        targetUrl.toString(),
-                        proxyBaseUrl
-                    );
-
+                rewrittenManifest = rewriteDashManifest(
+                    manifestText,
+                    targetUrl.toString(),
+                    proxyBaseUrl
+                );
             } else {
-
-                rewrittenManifest =
-                    rewriteHlsManifest(
-                        manifestText,
-                        targetUrl.toString(),
-                        proxyBaseUrl
-                    );
+                rewrittenManifest = rewriteHlsManifest(
+                    manifestText,
+                    targetUrl.toString(),
+                    proxyBaseUrl
+                );
             }
 
-            responseHeaders.delete(
-                'content-encoding'
-            );
-
-            responseHeaders.delete(
-                'content-length'
-            );
+            responseHeaders.delete('content-encoding');
+            responseHeaders.delete('content-length');
 
             if (
-                targetUrl.pathname
-                    .toLowerCase()
-                    .endsWith('.mpd')
+                targetUrl.pathname.toLowerCase().endsWith('.mpd')
             ) {
-
                 responseHeaders.set(
                     'Content-Type',
                     'application/dash+xml'
                 );
-
             } else if (
-                targetUrl.pathname
-                    .toLowerCase()
-                    .endsWith('.m3u8')
+                targetUrl.pathname.toLowerCase().endsWith('.m3u8')
             ) {
-
                 responseHeaders.set(
                     'Content-Type',
                     'application/vnd.apple.mpegurl'
                 );
             }
 
-            return new NextResponse(
-                rewrittenManifest,
-                {
-                    status:
-                        upstreamResponse.status,
-
-                    statusText:
-                        upstreamResponse.statusText,
-
-                    headers:
-                        responseHeaders,
-                }
-            );
+            return new NextResponse(rewrittenManifest, {
+                status: upstreamResponse.status,
+                statusText: upstreamResponse.statusText,
+                headers: responseHeaders,
+            });
         }
 
-        return new NextResponse(
-            upstreamResponse.body,
-            {
-                status:
-                    upstreamResponse.status,
-
-                statusText:
-                    upstreamResponse.statusText,
-
-                headers:
-                    responseHeaders,
-            }
-        );
+        return new NextResponse(upstreamResponse.body, {
+            status: upstreamResponse.status,
+            statusText: upstreamResponse.statusText,
+            headers: responseHeaders,
+        });
 
     } catch (error) {
-
-        console.error(
-            'CORS Proxy Error:',
-            error
-        );
+        console.error('CORS Proxy Error:', error);
 
         return NextResponse.json(
             {
-                error:
-                    'Proxy fetch failed',
-
+                error: 'Proxy fetch failed',
                 details:
                     error instanceof Error
                         ? error.message
@@ -760,8 +489,7 @@ async function handleProxy(req) {
             },
             {
                 status: 502,
-                headers:
-                    corsHeaders(),
+                headers: corsHeaders(),
             }
         );
     }
@@ -798,12 +526,8 @@ export async function DELETE(req) {
 ========================================================= */
 
 export async function OPTIONS() {
-    return new NextResponse(
-        null,
-        {
-            status: 204,
-            headers:
-                corsHeaders(),
-        }
-    );
+    return new NextResponse(null, {
+        status: 204,
+        headers: corsHeaders(),
+    });
 }

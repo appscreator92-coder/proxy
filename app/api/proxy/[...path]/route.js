@@ -13,24 +13,32 @@ const DEFAULT_UA =
     'Chrome/122.0.0.0 Safari/537.36';
 
 /*
- * IMPORTANT:
- * Add your streaming domains here so the security check 
- * allows them through.
+ * Suffix matching: 'example.com' also allows
+ * 'cdn.example.com', 'a.b.example.com', etc.
+ * Segment CDNs are often on a different subdomain than
+ * the manifest, so exact matching breaks playback.
  */
-
-const ALLOWED_HOSTS = new Set([
+const ALLOWED_HOSTS = [
     'your-domain.com',
-    'cdn.your-domain.com',
-    'sunnxt.com',
-    'livestream2.sunnxt.com',
-]);
+];
+
+function isAllowedHost(hostname) {
+    const host = hostname.toLowerCase();
+    return ALLOWED_HOSTS.some(
+        allowed => host === allowed || host.endsWith('.' + allowed)
+    );
+}
 
 
 /* =========================================================
    CORS HEADERS
 ========================================================= */
 
-function corsHeaders() {
+function corsHeaders(req) {
+    const requested = req?.headers.get(
+        'access-control-request-headers'
+    );
+
     return {
         'Access-Control-Allow-Origin': '*',
 
@@ -38,58 +46,69 @@ function corsHeaders() {
             'GET, HEAD, POST, PUT, DELETE, OPTIONS',
 
         'Access-Control-Allow-Headers':
-            'Range, Accept, Content-Type, Origin, Referer, User-Agent, Authorization',
+            requested ||
+            'Range, Accept, Content-Type, Origin, Referer, ' +
+            'User-Agent, Authorization, X-Requested-With',
 
+        /*
+         * Players need these readable. Date matters for
+         * live DASH UTC clock sync in dash.js.
+         */
         'Access-Control-Expose-Headers':
-            'Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified',
+            'Accept-Ranges, Content-Length, Content-Range, ' +
+            'Content-Type, ETag, Last-Modified, Date, Server-Timing',
 
         'Access-Control-Max-Age': '86400',
+        'Timing-Allow-Origin': '*',
     };
 }
 
 
 /* =========================================================
    GET TARGET URL
+
+   Preferred form:  /api/proxy?url=<encodeURIComponent(target)>
+   Legacy form:     /api/proxy/<target>
 ========================================================= */
 
-function getTargetFromPath(req) {
-    const pathname = req.nextUrl.pathname;
-    const search = req.nextUrl.search; // Capture search/query parameters (tokens, keys)
+function getTarget(req) {
+    const fromQuery = req.nextUrl.searchParams.get('url');
+    if (fromQuery) {
+        return fromQuery;
+    }
+
     const prefix = '/api/proxy/';
+    const pathname = req.nextUrl.pathname;
 
     if (!pathname.startsWith(prefix)) {
         return null;
     }
 
     let rawTarget = pathname.slice(prefix.length);
-
     if (!rawTarget) {
         return null;
     }
 
-    /*
-     * Safely decode URL-encoded target if it contains encoded characters.
-     */
     if (rawTarget.includes('%')) {
         try {
             rawTarget = decodeURIComponent(rawTarget);
         } catch {
-            // Keep original value if decoding fails.
+            // keep original if decoding fails
         }
     }
 
-    /*
-     * Repair routing that compressed protocol slashes:
-     * https:/ into https://
-     */
+    // Repair protocol slashes flattened by routing
     rawTarget = rawTarget
         .replace(/^https:\/+/, 'https://')
         .replace(/^http:\/+/, 'http://');
 
     /*
-     * Append query parameters back onto the target URL
+     * Only append our own query string if the decoded
+     * target does not already carry one. Otherwise you
+     * get "?a=1?b=2".
      */
-    if (search) {
+    const search = req.nextUrl.search;
+    if (search && !rawTarget.includes('?')) {
         rawTarget += search;
     }
 
@@ -98,34 +117,21 @@ function getTargetFromPath(req) {
 
 
 /* =========================================================
-   HOST VALIDATION
-========================================================= */
-
-function isAllowedHost(hostname) {
-    hostname = hostname.toLowerCase();
-    return ALLOWED_HOSTS.has(hostname);
-}
-
-
-/* =========================================================
    COPY RESPONSE HEADERS
 ========================================================= */
 
-function copyResponseHeaders(upstreamHeaders) {
+function copyResponseHeaders(upstreamHeaders, req) {
     const headers = new Headers();
 
     const allowedHeaders = [
         'content-type',
-        'content-length',
         'content-range',
         'accept-ranges',
         'cache-control',
         'etag',
         'last-modified',
         'expires',
-        'content-encoding',
         'content-disposition',
-        'vary',
     ];
 
     for (const name of allowedHeaders) {
@@ -136,9 +142,29 @@ function copyResponseHeaders(upstreamHeaders) {
     }
 
     /*
-     * Add CORS headers.
+     * NEVER forward content-encoding: fetch has already
+     * decompressed the body. Forwarding it makes the
+     * browser try to gunzip plain bytes.
+     *
+     * content-length is only safe when the body was not
+     * compressed upstream.
      */
-    const cors = corsHeaders();
+    const upstreamEncoding = (
+        upstreamHeaders.get('content-encoding') || ''
+    ).toLowerCase();
+
+    const wasCompressed =
+        upstreamEncoding &&
+        upstreamEncoding !== 'identity';
+
+    if (!wasCompressed) {
+        const length = upstreamHeaders.get('content-length');
+        if (length) {
+            headers.set('content-length', length);
+        }
+    }
+
+    const cors = corsHeaders(req);
     for (const [key, value] of Object.entries(cors)) {
         headers.set(key, value);
     }
@@ -149,23 +175,26 @@ function copyResponseHeaders(upstreamHeaders) {
 
 /* =========================================================
    MAKE PROXY URL
+
+   Placeholders like $Number$ / $Time$ / $RepresentationID$
+   MUST survive encoding, or DASH segment templates break.
 ========================================================= */
 
-function createProxyUrl(
-    originalUrl,
-    baseUrl,
-    proxyBaseUrl
-) {
-    try {
-        const absoluteUrl = new URL(
-            originalUrl,
-            baseUrl
-        ).toString();
+const TEMPLATE_TOKEN = /%24([A-Za-z]+)(%24|(%25[0-9]+d)?%24)/g;
 
-        return (
-            proxyBaseUrl +
-            encodeURIComponent(absoluteUrl)
-        );
+function restoreTemplateTokens(encoded) {
+    // Turn %24Number%24 back into $Number$
+    return encoded
+        .replace(/%24/g, '$')
+        .replace(/%25(0\d+d)/g, '%$1'); // $Number%05d$ formatting
+}
+
+function createProxyUrl(originalUrl, baseUrl, proxyBaseUrl) {
+    try {
+        const absoluteUrl = new URL(originalUrl, baseUrl).toString();
+        const encoded = encodeURIComponent(absoluteUrl);
+
+        return proxyBaseUrl + restoreTemplateTokens(encoded);
     } catch {
         return originalUrl;
     }
@@ -176,33 +205,23 @@ function createProxyUrl(
    REWRITE DASH MANIFEST
 ========================================================= */
 
-function rewriteDashManifest(
-    manifest,
-    targetUrl,
-    proxyBaseUrl
-) {
-    const baseUrl = new URL(
-        './',
-        targetUrl
-    ).toString();
+function rewriteDashManifest(manifest, targetUrl, proxyBaseUrl) {
+    const baseUrl = new URL('./', targetUrl).toString();
 
+    // media / initialization / sourceURL attributes
     manifest = manifest.replace(
-        /\b(media|initialization|sourceURL|index|indexRange)=["']([^"']+)["']/gi,
+        /\b(media|initialization|sourceURL)=["']([^"']+)["']/gi,
         (match, attribute, value) => {
-            if (attribute.toLowerCase() === 'indexrange') {
-                return match;
-            }
-
             const proxied = createProxyUrl(
                 value,
                 baseUrl,
                 proxyBaseUrl
             );
-
             return `${attribute}="${proxied}"`;
         }
     );
 
+    // <BaseURL>...</BaseURL>
     manifest = manifest.replace(
         /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/gi,
         (match, start, value, end) => {
@@ -210,14 +229,45 @@ function rewriteDashManifest(
             if (!trimmed) {
                 return match;
             }
-
             const proxied = createProxyUrl(
                 trimmed,
                 baseUrl,
                 proxyBaseUrl
             );
-
             return `${start}${proxied}${end}`;
+        }
+    );
+
+    // <Location> for live manifest relocation
+    manifest = manifest.replace(
+        /(<Location[^>]*>)([^<]+)(<\/Location>)/gi,
+        (match, start, value, end) => {
+            const trimmed = value.trim();
+            if (!trimmed) {
+                return match;
+            }
+            const proxied = createProxyUrl(
+                trimmed,
+                baseUrl,
+                proxyBaseUrl
+            );
+            return `${start}${proxied}${end}`;
+        }
+    );
+
+    // <UTCTiming value="https://..."> for live clock sync
+    manifest = manifest.replace(
+        /(<UTCTiming[^>]*\bvalue=)["']([^"']+)["']/gi,
+        (match, start, value) => {
+            if (!/^https?:\/\//i.test(value)) {
+                return match;
+            }
+            const proxied = createProxyUrl(
+                value,
+                baseUrl,
+                proxyBaseUrl
+            );
+            return `${start}"${proxied}"`;
         }
     );
 
@@ -229,16 +279,8 @@ function rewriteDashManifest(
    REWRITE HLS MANIFEST
 ========================================================= */
 
-function rewriteHlsManifest(
-    manifest,
-    targetUrl,
-    proxyBaseUrl
-) {
-    const baseUrl = new URL(
-        './',
-        targetUrl
-    ).toString();
-
+function rewriteHlsManifest(manifest, targetUrl, proxyBaseUrl) {
+    const baseUrl = new URL('./', targetUrl).toString();
     const lines = manifest.split(/\r?\n/);
 
     const result = lines.map(line => {
@@ -248,6 +290,7 @@ function rewriteHlsManifest(
             return line;
         }
 
+        // Covers #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.
         if (trimmed.startsWith('#')) {
             return line.replace(
                 /URI="([^"]+)"/gi,
@@ -262,11 +305,7 @@ function rewriteHlsManifest(
             );
         }
 
-        return createProxyUrl(
-            trimmed,
-            baseUrl,
-            proxyBaseUrl
-        );
+        return createProxyUrl(trimmed, baseUrl, proxyBaseUrl);
     });
 
     return result.join('\n');
@@ -281,24 +320,16 @@ function isManifest(targetUrl, contentType) {
     const pathname = targetUrl.pathname.toLowerCase();
     const type = contentType.toLowerCase();
 
-    if (
-        pathname.endsWith('.mpd') ||
-        pathname.endsWith('.m3u8')
-    ) {
+    if (pathname.endsWith('.mpd') || pathname.endsWith('.m3u8')) {
         return true;
     }
 
-    if (
+    return (
         type.includes('mpegurl') ||
-        type.includes('vnd.apple.mpegurl') ||
         type.includes('dash+xml') ||
         type.includes('application/xml') ||
         type.includes('text/xml')
-    ) {
-        return true;
-    }
-
-    return false;
+    );
 }
 
 
@@ -308,12 +339,12 @@ function isManifest(targetUrl, contentType) {
 
 async function handleProxy(req) {
     try {
-        let rawTarget = getTargetFromPath(req);
+        const rawTarget = getTarget(req);
 
         if (!rawTarget) {
             return NextResponse.json(
                 { error: 'Missing target URL' },
-                { status: 400, headers: corsHeaders() }
+                { status: 400, headers: corsHeaders(req) }
             );
         }
 
@@ -323,7 +354,7 @@ async function handleProxy(req) {
         } catch {
             return NextResponse.json(
                 { error: 'Invalid target URL', target: rawTarget },
-                { status: 400, headers: corsHeaders() }
+                { status: 400, headers: corsHeaders(req) }
             );
         }
 
@@ -333,36 +364,39 @@ async function handleProxy(req) {
         ) {
             return NextResponse.json(
                 { error: 'Only HTTP and HTTPS URLs are allowed' },
-                { status: 400, headers: corsHeaders() }
+                { status: 400, headers: corsHeaders(req) }
             );
         }
 
         if (!isAllowedHost(targetUrl.hostname)) {
             return NextResponse.json(
-                { error: 'Target host is not allowed', host: targetUrl.hostname },
-                { status: 403, headers: corsHeaders() }
+                {
+                    error: 'Target host is not allowed',
+                    host: targetUrl.hostname,
+                },
+                { status: 403, headers: corsHeaders(req) }
             );
         }
 
         const upstreamHeaders = new Headers();
 
-        const userAgent =
-            req.headers.get('user-agent') || DEFAULT_UA;
-        upstreamHeaders.set('User-Agent', userAgent);
+        upstreamHeaders.set(
+            'User-Agent',
+            req.headers.get('user-agent') || DEFAULT_UA
+        );
         upstreamHeaders.set(
             'Accept',
             req.headers.get('accept') || '*/*'
         );
 
-        const referer =
-            req.headers.get('referer') ||
-            `${targetUrl.origin}/`;
-        upstreamHeaders.set('Referer', referer);
-
-        const origin = req.headers.get('origin');
-        if (origin) {
-            upstreamHeaders.set('Origin', origin);
-        }
+        /*
+         * Do NOT forward the browser's Referer/Origin.
+         * Sending "http://localhost:3000" to a CDN with
+         * hotlink protection gets you a 403. Present the
+         * target's own origin instead.
+         */
+        upstreamHeaders.set('Referer', `${targetUrl.origin}/`);
+        upstreamHeaders.set('Origin', targetUrl.origin);
 
         const range = req.headers.get('range');
         if (range) {
@@ -403,7 +437,8 @@ async function handleProxy(req) {
             upstreamResponse.headers.get('content-type') || '';
 
         const responseHeaders = copyResponseHeaders(
-            upstreamResponse.headers
+            upstreamResponse.headers,
+            req
         );
 
         if (isManifest(targetUrl, contentType)) {
@@ -413,7 +448,7 @@ async function handleProxy(req) {
             if (!host) {
                 return NextResponse.json(
                     { error: 'Unable to determine proxy host' },
-                    { status: 500, headers: corsHeaders() }
+                    { status: 500, headers: corsHeaders(req) }
                 );
             }
 
@@ -421,47 +456,49 @@ async function handleProxy(req) {
                 req.headers.get('x-forwarded-proto') ||
                 (req.nextUrl.protocol || 'https:').replace(':', '');
 
-            const proxyBaseUrl = `${protocol}://${host}/api/proxy/`;
+            const proxyBaseUrl =
+                `${protocol}://${host}/api/proxy?url=`;
 
-            let rewrittenManifest;
+            /*
+             * Resolve relative URLs against the FINAL url
+             * after redirects, not the requested one.
+             */
+            const effectiveUrl =
+                upstreamResponse.url || targetUrl.toString();
 
-            if (
-                targetUrl.pathname
+            const isDash =
+                new URL(effectiveUrl).pathname
                     .toLowerCase()
                     .endsWith('.mpd') ||
-                contentType.toLowerCase().includes('dash+xml')
-            ) {
-                rewrittenManifest = rewriteDashManifest(
-                    manifestText,
-                    targetUrl.toString(),
-                    proxyBaseUrl
-                );
-            } else {
-                rewrittenManifest = rewriteHlsManifest(
-                    manifestText,
-                    targetUrl.toString(),
-                    proxyBaseUrl
-                );
-            }
+                contentType.toLowerCase().includes('dash+xml');
+
+            const rewrittenManifest = isDash
+                ? rewriteDashManifest(
+                      manifestText,
+                      effectiveUrl,
+                      proxyBaseUrl
+                  )
+                : rewriteHlsManifest(
+                      manifestText,
+                      effectiveUrl,
+                      proxyBaseUrl
+                  );
 
             responseHeaders.delete('content-encoding');
             responseHeaders.delete('content-length');
 
-            if (
-                targetUrl.pathname.toLowerCase().endsWith('.mpd')
-            ) {
-                responseHeaders.set(
-                    'Content-Type',
-                    'application/dash+xml'
-                );
-            } else if (
-                targetUrl.pathname.toLowerCase().endsWith('.m3u8')
-            ) {
-                responseHeaders.set(
-                    'Content-Type',
-                    'application/vnd.apple.mpegurl'
-                );
-            }
+            responseHeaders.set(
+                'Content-Type',
+                isDash
+                    ? 'application/dash+xml'
+                    : 'application/vnd.apple.mpegurl'
+            );
+
+            // Live manifests must not be cached
+            responseHeaders.set(
+                'Cache-Control',
+                'no-store, no-cache, must-revalidate'
+            );
 
             return new NextResponse(rewrittenManifest, {
                 status: upstreamResponse.status,
@@ -487,10 +524,7 @@ async function handleProxy(req) {
                         ? error.message
                         : String(error),
             },
-            {
-                status: 502,
-                headers: corsHeaders(),
-            }
+            { status: 502, headers: corsHeaders(req) }
         );
     }
 }
@@ -500,34 +534,20 @@ async function handleProxy(req) {
    HTTP METHODS
 ========================================================= */
 
-export async function GET(req) {
-    return handleProxy(req);
-}
-
-export async function HEAD(req) {
-    return handleProxy(req);
-}
-
-export async function POST(req) {
-    return handleProxy(req);
-}
-
-export async function PUT(req) {
-    return handleProxy(req);
-}
-
-export async function DELETE(req) {
-    return handleProxy(req);
-}
+export async function GET(req)    { return handleProxy(req); }
+export async function HEAD(req)   { return handleProxy(req); }
+export async function POST(req)   { return handleProxy(req); }
+export async function PUT(req)    { return handleProxy(req); }
+export async function DELETE(req) { return handleProxy(req); }
 
 
 /* =========================================================
    CORS PREFLIGHT
 ========================================================= */
 
-export async function OPTIONS() {
+export async function OPTIONS(req) {
     return new NextResponse(null, {
         status: 204,
-        headers: corsHeaders(),
+        headers: corsHeaders(req),
     });
 }

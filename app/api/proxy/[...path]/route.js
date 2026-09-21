@@ -21,20 +21,26 @@ async function handleProxy(req) {
     }
 
     try {
+        // Fetch target URL without forwarding restricted headers (origin, referer, user-agent)
         const apiResponse = await fetch(rawTarget, {
             method: req.method,
             headers: {
-                'Content-Type': req.headers.get('content-type') || 'application/json',
-                ...(req.headers.get('authorization') && { 'Authorization': req.headers.get('authorization') })
+                // Set a clean generic user-agent or omit it entirely
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                // Explicitly drop or override incoming Origin/Referer to prevent server blocks
             },
         });
 
-        const data = await apiResponse.text();
-        const response = new NextResponse(data, { status: apiResponse.status });
+        const data = await apiResponse.arrayBuffer(); // Use arrayBuffer to safely handle binary video chunks (.m4s, .ts)
 
+        const response = new NextResponse(data, {
+            status: apiResponse.status,
+        });
+
+        // Attach permissive CORS headers for your frontend player
         response.headers.set('Access-Control-Allow-Origin', '*');
         response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        response.headers.set('Access-Control-Allow-Headers', '*');
 
         const contentType = apiResponse.headers.get('content-type');
         if (contentType) {
@@ -57,7 +63,7 @@ export async function OPTIONS() {
         headers: {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Allow-Headers': '*',
         },
     });
 }

@@ -21,23 +21,26 @@ async function handleProxy(req) {
     }
 
     try {
-        // Fetch target URL without forwarding restricted headers (origin, referer, user-agent)
+        // Extract target domain to use as a spoofed referer if needed
+        const targetUrlObj = new URL(rawTarget);
+        const targetOrigin = `${targetUrlObj.protocol}//${targetUrlObj.host}`;
+
         const apiResponse = await fetch(rawTarget, {
             method: req.method,
             headers: {
-                // Set a clean generic user-agent or omit it entirely
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                // Explicitly drop or override incoming Origin/Referer to prevent server blocks
+                // Provide a standard desktop browser user agent
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                // Provide a referer matching the target streaming domain to bypass 403 blocks
+                'Referer': targetOrigin + '/',
             },
         });
 
-        const data = await apiResponse.arrayBuffer(); // Use arrayBuffer to safely handle binary video chunks (.m4s, .ts)
+        const data = await apiResponse.arrayBuffer();
 
         const response = new NextResponse(data, {
             status: apiResponse.status,
         });
 
-        // Attach permissive CORS headers for your frontend player
         response.headers.set('Access-Control-Allow-Origin', '*');
         response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         response.headers.set('Access-Control-Allow-Headers', '*');

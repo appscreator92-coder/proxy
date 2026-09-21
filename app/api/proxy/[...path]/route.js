@@ -23,6 +23,7 @@ const ALLOWED_HOSTS = new Set([
     'livestream.sunnxt.com',
     'sunnxt.com',
     'livestream2.sunnxt.com',
+    '193.47.62.190',
 ]);
 
 

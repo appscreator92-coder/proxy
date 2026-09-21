@@ -24,31 +24,34 @@ async function handleProxy(req) {
         const targetUrlObj = new URL(rawTarget);
         const targetOrigin = `${targetUrlObj.protocol}//${targetUrlObj.host}`;
 
-        // Fetch from target streaming server
+        // Capture headers from the incoming request or use smart fallbacks
+        const clientUserAgent = req.headers.get('user-agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+        const clientReferer = req.headers.get('referer') || targetOrigin + '/';
+        const clientOrigin = req.headers.get('origin') || targetOrigin;
+
+        // Fetch from target streaming server while forwarding/managing headers
         const apiResponse = await fetch(rawTarget, {
             method: req.method,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'Referer': targetOrigin + '/',
+                'User-Agent': clientUserAgent,
+                'Referer': clientReferer,
+                'Origin': clientOrigin,
             },
         });
 
-        // Create response headers matching the target stream
         const responseHeaders = new Headers();
         
-        // Pass vital content headers through
         const contentType = apiResponse.headers.get('content-type');
         if (contentType) responseHeaders.set('Content-Type', contentType);
         
         const contentRange = apiResponse.headers.get('content-range');
         if (contentRange) responseHeaders.set('Content-Range', contentRange);
 
-        // Attach permissive CORS headers
+        // Permissive CORS headers for your video player
         responseHeaders.set('Access-Control-Allow-Origin', '*');
         responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         responseHeaders.set('Access-Control-Allow-Headers', '*');
 
-        // Stream the response body directly back (crucial for video chunks/playlists)
         return new NextResponse(apiResponse.body, {
             status: apiResponse.status,
             headers: responseHeaders,

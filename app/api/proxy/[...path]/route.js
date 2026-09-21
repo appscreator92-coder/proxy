@@ -1,22 +1,27 @@
 import { NextResponse } from 'next/server';
 
-async function handleProxy(req) {
+export async function handleProxy(req) {
     const urlPath = req.nextUrl.pathname; 
     const prefix = '/api/proxy/';
+    
+    // Extract everything after /api/proxy/
     let rawTarget = urlPath.startsWith(prefix) ? urlPath.slice(prefix.length) : '';
 
     if (!rawTarget) {
         return NextResponse.json({ error: 'Missing target URL' }, { status: 400 });
     }
 
-    // Handle malformed URL slashes resulting from routing
+    // Fix broken protocol slashes caused by routing
     if (rawTarget.startsWith('http:/') && !rawTarget.startsWith('http://')) {
         rawTarget = rawTarget.replace('http:/', 'http://');
     } else if (rawTarget.startsWith('https:/') && !rawTarget.startsWith('https://')) {
         rawTarget = rawTarget.replace('https:/', 'https://');
     }
 
-    // Append query strings if present
+    // Fix double slashes in the middle of the URL (except after http:// or https://)
+    rawTarget = rawTarget.replace(/([^:])\/+/g, '$1/');
+
+    // Append query parameters if any exist
     const searchParams = req.nextUrl.search;
     if (searchParams) {
         rawTarget += searchParams;
@@ -30,10 +35,9 @@ async function handleProxy(req) {
         const clientReferer = req.headers.get('referer') || targetOrigin + '/';
         const clientOrigin = req.headers.get('origin') || targetOrigin;
 
-        // Fetch target URL and explicitly tell it to follow redirects safely server-side
         const apiResponse = await fetch(rawTarget, {
             method: req.method,
-            redirect: 'follow', 
+            redirect: 'follow',
             headers: {
                 'User-Agent': clientUserAgent,
                 'Referer': clientReferer,
@@ -49,7 +53,6 @@ async function handleProxy(req) {
         const contentRange = apiResponse.headers.get('content-range');
         if (contentRange) responseHeaders.set('Content-Range', contentRange);
 
-        // Permissive CORS headers
         responseHeaders.set('Access-Control-Allow-Origin', '*');
         responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         responseHeaders.set('Access-Control-Allow-Headers', '*');

@@ -3,227 +3,1031 @@ import { NextResponse } from 'next/server';
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
+/* =========================================================
+   CONFIGURATION
+========================================================= */
+
 const DEFAULT_UA =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/122.0.0.0 Safari/537.36';
+
+/*
+ * IMPORTANT:
+ * Add only domains that you are authorized to proxy.
+ *
+ * Example:
+ *
+ * const ALLOWED_HOSTS = new Set([
+ *     'https://livestream2.sunnxt.com',
+       'https://livestream.sunnxt.com',
+       'https://livestream3.sunnxt.com',
+ *     'https://livestream1.sunnxt.com',
+ * ]);
+ *
+ * If you use multiple subdomains, add them individually.
+ */
+
+const ALLOWED_HOSTS = new Set([
+    'your-domain.com',
+    'cdn.your-domain.com',
+]);
+
+
+/* =========================================================
+   CORS HEADERS
+========================================================= */
+
+function corsHeaders() {
+    return {
+        'Access-Control-Allow-Origin': '*',
+
+        'Access-Control-Allow-Methods':
+            'GET, HEAD, POST, PUT, DELETE, OPTIONS',
+
+        'Access-Control-Allow-Headers':
+            'Range, Accept, Content-Type, Origin, Referer, User-Agent, Authorization',
+
+        'Access-Control-Expose-Headers':
+            'Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified',
+
+        'Access-Control-Max-Age': '86400',
+    };
+}
+
+
+/* =========================================================
+   GET TARGET URL
+========================================================= */
 
 function getTargetFromPath(req) {
+
     const pathname = req.nextUrl.pathname;
+
     const prefix = '/api/proxy/';
 
     if (!pathname.startsWith(prefix)) {
         return null;
     }
 
-    let encodedTarget = pathname.slice(prefix.length);
+    let rawTarget = pathname.slice(prefix.length);
 
-    if (!encodedTarget) {
+    if (!rawTarget) {
         return null;
     }
 
+    /*
+     * Decode URL-encoded target.
+     */
     try {
-        encodedTarget = decodeURIComponent(encodedTarget);
+        rawTarget = decodeURIComponent(rawTarget);
     } catch {
-        // Keep original value if decoding fails
+        // Keep original value.
+    }
+
+    /*
+     * Repair routing that changed:
+     *
+     * https://
+     *
+     * into:
+     *
+     * https:/
+     */
+
+    if (
+        rawTarget.startsWith('https:/') &&
+        !rawTarget.startsWith('https://')
+    ) {
+        rawTarget = rawTarget.replace(
+            /^https:\//,
+            'https://'
+        );
     }
 
     if (
-        encodedTarget.startsWith('https:/') &&
-        !encodedTarget.startsWith('https://')
+        rawTarget.startsWith('http:/') &&
+        !rawTarget.startsWith('http://')
     ) {
-        encodedTarget = encodedTarget.replace(/^https:\//, 'https://');
+        rawTarget = rawTarget.replace(
+            /^http:\//,
+            'http://'
+        );
     }
 
-    if (
-        encodedTarget.startsWith('http:/') &&
-        !encodedTarget.startsWith('http://')
-    ) {
-        encodedTarget = encodedTarget.replace(/^http:\//, 'http://');
-    }
-
-    return encodedTarget;
+    return rawTarget;
 }
 
-function corsHeaders() {
-    return {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods':
-            'GET, HEAD, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers':
-            'Range, Accept, Content-Type, Origin, Referer, User-Agent, Authorization',
-        'Access-Control-Expose-Headers':
-            'Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified',
-        'Access-Control-Max-Age': '86400',
-    };
+
+/* =========================================================
+   HOST VALIDATION
+========================================================= */
+
+function isAllowedHost(hostname) {
+
+    hostname = hostname.toLowerCase();
+
+    return ALLOWED_HOSTS.has(hostname);
 }
 
-/**
- * Automatically rewrites internal URLs inside DASH (.mpd) and HLS (.m3u8) manifests
- * so that all media chunks route through this proxy automatically.
- */
-function rewriteManifestContent(manifestText, targetUrl, proxyBaseUrl) {
-    const targetBase = new URL('.', targetUrl).toString();
 
-    const makeProxiedUrl = (originalLink) => {
-        let absoluteUrl;
-        try {
-            absoluteUrl = new URL(originalLink, targetBase).toString();
-        } catch {
-            return originalLink;
+/* =========================================================
+   COPY RESPONSE HEADERS
+========================================================= */
+
+function copyResponseHeaders(upstreamHeaders) {
+
+    const headers = new Headers();
+
+    const allowedHeaders = [
+
+        'content-type',
+
+        'content-length',
+
+        'content-range',
+
+        'accept-ranges',
+
+        'cache-control',
+
+        'etag',
+
+        'last-modified',
+
+        'expires',
+
+        'content-encoding',
+
+        'content-disposition',
+
+        'vary',
+
+    ];
+
+    for (const name of allowedHeaders) {
+
+        const value =
+            upstreamHeaders.get(name);
+
+        if (value) {
+            headers.set(name, value);
         }
-        return `${proxyBaseUrl}${absoluteUrl}`;
-    };
+    }
 
-    // 1. DASH (.mpd) Manifest Rewriting
-    let rewritten = manifestText.replace(
-        /(media|initialization|sourceURL)=["']([^"']+)["']/g,
-        (match, attr, link) => {
-            return `${attr}="${makeProxiedUrl(link)}"`;
+    /*
+     * Add CORS headers.
+     */
+
+    const cors = corsHeaders();
+
+    for (const [key, value]
+        of Object.entries(cors)) {
+
+        headers.set(key, value);
+    }
+
+    return headers;
+}
+
+
+/* =========================================================
+   MAKE PROXY URL
+========================================================= */
+
+function createProxyUrl(
+    originalUrl,
+    baseUrl,
+    proxyBaseUrl
+) {
+
+    try {
+
+        /*
+         * Convert relative URL into absolute URL.
+         */
+        const absoluteUrl =
+            new URL(
+                originalUrl,
+                baseUrl
+            ).toString();
+
+        /*
+         * Encode target so characters such as:
+         *
+         * ?
+         * &
+         * =
+         *
+         * do not break the proxy route.
+         */
+
+        return (
+            proxyBaseUrl +
+            encodeURIComponent(absoluteUrl)
+        );
+
+    } catch {
+
+        return originalUrl;
+    }
+}
+
+
+/* =========================================================
+   REWRITE DASH MANIFEST
+========================================================= */
+
+function rewriteDashManifest(
+    manifest,
+    targetUrl,
+    proxyBaseUrl
+) {
+
+    /*
+     * Directory containing the MPD.
+     */
+    const baseUrl =
+        new URL(
+            './',
+            targetUrl
+        ).toString();
+
+
+    /*
+     * MPD attributes that commonly contain URLs.
+     */
+
+    manifest = manifest.replace(
+        /\b(media|initialization|sourceURL|index|indexRange)=["']([^"']+)["']/gi,
+
+        (match, attribute, value) => {
+
+            /*
+             * indexRange is NOT a URL.
+             */
+            if (
+                attribute.toLowerCase() ===
+                'indexrange'
+            ) {
+                return match;
+            }
+
+            const proxied =
+                createProxyUrl(
+                    value,
+                    baseUrl,
+                    proxyBaseUrl
+                );
+
+            return `${attribute}="${proxied}"`;
         }
     );
 
-    // 2. HLS (.m3u8) Manifest Rewriting
-    const lines = rewritten.split('\n');
-    const processedLines = lines.map((line) => {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) {
-            if (trimmed.includes('URI="')) {
-                return trimmed.replace(/URI="([^"]+)"/, (m, uri) => `URI="${makeProxiedUrl(uri)}"`);
-            }
-            return line;
-        }
-        return makeProxiedUrl(trimmed);
-    });
 
-    return processedLines.join('\n');
+    /*
+     * Handle BaseURL elements.
+     *
+     * Example:
+     *
+     * <BaseURL>video/</BaseURL>
+     */
+
+    manifest = manifest.replace(
+        /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/gi,
+
+        (match, start, value, end) => {
+
+            const trimmed =
+                value.trim();
+
+            if (!trimmed) {
+                return match;
+            }
+
+            const proxied =
+                createProxyUrl(
+                    trimmed,
+                    baseUrl,
+                    proxyBaseUrl
+                );
+
+            return (
+                `${start}${proxied}${end}`
+            );
+        }
+    );
+
+
+    return manifest;
 }
 
-async function handleProxy(req) {
-    try {
-        let rawTarget = getTargetFromPath(req);
 
-        // Crucial: Append query parameters (tokens, keys, etc.) back onto the target URL
-        if (req.nextUrl.search) {
-            rawTarget += req.nextUrl.search;
+/* =========================================================
+   REWRITE HLS MANIFEST
+========================================================= */
+
+function rewriteHlsManifest(
+    manifest,
+    targetUrl,
+    proxyBaseUrl
+) {
+
+    /*
+     * HLS base directory.
+     */
+
+    const baseUrl =
+        new URL(
+            './',
+            targetUrl
+        ).toString();
+
+
+    const lines =
+        manifest.split(/\r?\n/);
+
+
+    const result = lines.map(line => {
+
+        const trimmed =
+            line.trim();
+
+
+        /*
+         * Empty line.
+         */
+
+        if (!trimmed) {
+            return line;
         }
+
+
+        /*
+         * EXT-X tags.
+         */
+
+        if (trimmed.startsWith('#')) {
+
+            /*
+             * URI="..."
+             *
+             * Used by:
+             *
+             * EXT-X-KEY
+             * EXT-X-MAP
+             * EXT-X-MEDIA
+             * EXT-X-I-FRAME-STREAM-INF
+             * etc.
+             */
+
+            return line.replace(
+                /URI="([^"]+)"/gi,
+
+                (match, uri) => {
+
+                    const proxied =
+                        createProxyUrl(
+                            uri,
+                            baseUrl,
+                            proxyBaseUrl
+                        );
+
+                    return `URI="${proxied}"`;
+                }
+            );
+        }
+
+
+        /*
+         * Normal HLS segment / playlist URL.
+         */
+
+        return createProxyUrl(
+            trimmed,
+            baseUrl,
+            proxyBaseUrl
+        );
+    });
+
+
+    return result.join('\n');
+}
+
+
+/* =========================================================
+   DETECT MANIFEST
+========================================================= */
+
+function isManifest(
+    targetUrl,
+    contentType
+) {
+
+    const pathname =
+        targetUrl.pathname.toLowerCase();
+
+    const type =
+        contentType.toLowerCase();
+
+
+    /*
+     * File extension.
+     */
+
+    if (
+        pathname.endsWith('.mpd') ||
+        pathname.endsWith('.m3u8')
+    ) {
+        return true;
+    }
+
+
+    /*
+     * Content-Type.
+     */
+
+    if (
+        type.includes('mpegurl') ||
+        type.includes('vnd.apple.mpegurl') ||
+        type.includes('dash+xml') ||
+        type.includes('application/xml') ||
+        type.includes('text/xml')
+    ) {
+        return true;
+    }
+
+
+    return false;
+}
+
+
+/* =========================================================
+   MAIN PROXY
+========================================================= */
+
+async function handleProxy(req) {
+
+    try {
+
+        let rawTarget =
+            getTargetFromPath(req);
+
+
+        /*
+         * Validate target.
+         */
 
         if (!rawTarget) {
-            return NextResponse.json({ error: 'Missing target URL' }, { status: 400, headers: corsHeaders() });
+
+            return NextResponse.json(
+                {
+                    error:
+                        'Missing target URL',
+                },
+                {
+                    status: 400,
+                    headers:
+                        corsHeaders(),
+                }
+            );
         }
+
 
         let targetUrl;
+
+
+        /*
+         * Parse target.
+         */
+
         try {
-            targetUrl = new URL(rawTarget);
+
+            targetUrl =
+                new URL(rawTarget);
+
         } catch {
-            return NextResponse.json({ error: 'Invalid target URL', target: rawTarget }, { status: 400, headers: corsHeaders() });
+
+            return NextResponse.json(
+                {
+                    error:
+                        'Invalid target URL',
+
+                    target:
+                        rawTarget,
+                },
+                {
+                    status: 400,
+                    headers:
+                        corsHeaders(),
+                }
+            );
         }
 
-        if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
-            return NextResponse.json({ error: 'Only HTTP and HTTPS URLs are allowed' }, { status: 400, headers: corsHeaders() });
+
+        /*
+         * Only HTTP/HTTPS.
+         */
+
+        if (
+            targetUrl.protocol !==
+                'http:' &&
+
+            targetUrl.protocol !==
+                'https:'
+        ) {
+
+            return NextResponse.json(
+                {
+                    error:
+                        'Only HTTP and HTTPS URLs are allowed',
+                },
+                {
+                    status: 400,
+                    headers:
+                        corsHeaders(),
+                }
+            );
         }
 
-        const upstreamHeaders = new Headers();
-        const userAgent = req.headers.get('user-agent') || DEFAULT_UA;
-        const referer = req.headers.get('referer') || `${targetUrl.origin}/`;
 
-        upstreamHeaders.set('User-Agent', userAgent);
-        upstreamHeaders.set('Accept', '*/*');
-        upstreamHeaders.set('Referer', referer);
+        /*
+         * SECURITY:
+         *
+         * Only proxy authorized hosts.
+         */
 
-        const origin = req.headers.get('origin');
-        if (origin) upstreamHeaders.set('Origin', origin);
+        if (
+            !isAllowedHost(
+                targetUrl.hostname
+            )
+        ) {
 
-        const range = req.headers.get('range');
-        if (range) upstreamHeaders.set('Range', range);
+            return NextResponse.json(
+                {
+                    error:
+                        'Target host is not allowed',
 
-        const accept = req.headers.get('accept');
-        if (accept) upstreamHeaders.set('Accept', accept);
+                    host:
+                        targetUrl.hostname,
+                },
+                {
+                    status: 403,
+                    headers:
+                        corsHeaders(),
+                }
+            );
+        }
 
-        const contentType = req.headers.get('content-type');
-        if (contentType) upstreamHeaders.set('Content-Type', contentType);
 
-        const authorization = req.headers.get('authorization');
-        if (authorization) upstreamHeaders.set('Authorization', authorization);
+        /* =====================================================
+           UPSTREAM REQUEST HEADERS
+        ===================================================== */
+
+        const upstreamHeaders =
+            new Headers();
+
+
+        /*
+         * User-Agent.
+         */
+
+        const userAgent =
+            req.headers.get(
+                'user-agent'
+            ) || DEFAULT_UA;
+
+
+        upstreamHeaders.set(
+            'User-Agent',
+            userAgent
+        );
+
+
+        /*
+         * Accept.
+         */
+
+        upstreamHeaders.set(
+            'Accept',
+            req.headers.get(
+                'accept'
+            ) || '*/*'
+        );
+
+
+        /*
+         * Referer.
+         */
+
+        const referer =
+            req.headers.get(
+                'referer'
+            ) ||
+            `${targetUrl.origin}/`;
+
+
+        upstreamHeaders.set(
+            'Referer',
+            referer
+        );
+
+
+        /*
+         * Origin.
+         */
+
+        const origin =
+            req.headers.get(
+                'origin'
+            );
+
+        if (origin) {
+
+            upstreamHeaders.set(
+                'Origin',
+                origin
+            );
+        }
+
+
+        /*
+         * Range.
+         *
+         * Important for:
+         *
+         * DASH
+         * MP4
+         * fMP4
+         * seeking
+         */
+
+        const range =
+            req.headers.get(
+                'range'
+            );
+
+        if (range) {
+
+            upstreamHeaders.set(
+                'Range',
+                range
+            );
+        }
+
+
+        /*
+         * Authorization.
+         */
+
+        const authorization =
+            req.headers.get(
+                'authorization'
+            );
+
+        if (authorization) {
+
+            upstreamHeaders.set(
+                'Authorization',
+                authorization
+            );
+        }
+
+
+        /*
+         * Content-Type.
+         */
+
+        const requestContentType =
+            req.headers.get(
+                'content-type'
+            );
+
+        if (requestContentType) {
+
+            upstreamHeaders.set(
+                'Content-Type',
+                requestContentType
+            );
+        }
+
+
+        /* =====================================================
+           FETCH OPTIONS
+        ===================================================== */
 
         const fetchOptions = {
-            method: req.method,
-            headers: upstreamHeaders,
-            redirect: 'follow',
-            cache: 'no-store',
+
+            method:
+                req.method,
+
+            headers:
+                upstreamHeaders,
+
+            redirect:
+                'follow',
+
+            cache:
+                'no-store',
+
         };
 
-        if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
-            fetchOptions.body = await req.arrayBuffer();
+
+        /*
+         * Forward body for non-GET requests.
+         */
+
+        if (
+            req.method !== 'GET' &&
+            req.method !== 'HEAD' &&
+            req.method !== 'OPTIONS'
+        ) {
+
+            fetchOptions.body =
+                await req.arrayBuffer();
         }
 
-        const upstreamResponse = await fetch(targetUrl.toString(), fetchOptions);
-        const upstreamContentType = upstreamResponse.headers.get('content-type') || '';
 
-        const responseHeaders = new Headers();
-        const allowedHeaders = [
-            'content-type', 'content-length', 'content-range', 'accept-ranges',
-            'cache-control', 'etag', 'last-modified', 'expires', 'content-encoding',
-            'content-disposition', 'vary',
-        ];
+        /* =====================================================
+           FETCH UPSTREAM
+        ===================================================== */
 
-        for (const name of allowedHeaders) {
-            const value = upstreamResponse.headers.get(name);
-            if (value) responseHeaders.set(name, value);
+        const upstreamResponse =
+            await fetch(
+                targetUrl.toString(),
+                fetchOptions
+            );
+
+
+        const contentType =
+            upstreamResponse.headers.get(
+                'content-type'
+            ) || '';
+
+
+        /* =====================================================
+           RESPONSE HEADERS
+        ===================================================== */
+
+        const responseHeaders =
+            copyResponseHeaders(
+                upstreamResponse.headers
+            );
+
+
+        /* =====================================================
+           MANIFEST HANDLING
+        ===================================================== */
+
+        if (
+            isManifest(
+                targetUrl,
+                contentType
+            )
+        ) {
+
+            /*
+             * Read manifest as text.
+             */
+
+            const manifestText =
+                await upstreamResponse.text();
+
+
+            /*
+             * Determine public proxy URL.
+             */
+
+            const host =
+                req.headers.get(
+                    'host'
+                );
+
+
+            if (!host) {
+
+                return NextResponse.json(
+                    {
+                        error:
+                            'Unable to determine proxy host',
+                    },
+                    {
+                        status: 500,
+                        headers:
+                            corsHeaders(),
+                    }
+                );
+            }
+
+
+            const protocol =
+                req.headers.get(
+                    'x-forwarded-proto'
+                ) ||
+                (
+                    req.nextUrl.protocol ||
+                    'https:'
+                ).replace(':', '');
+
+
+            const proxyBaseUrl =
+                `${protocol}://${host}/api/proxy/`;
+
+
+            let rewrittenManifest;
+
+
+            /*
+             * Select DASH or HLS.
+             */
+
+            if (
+                targetUrl.pathname
+                    .toLowerCase()
+                    .endsWith('.mpd') ||
+                contentType
+                    .toLowerCase()
+                    .includes('dash+xml')
+            ) {
+
+                rewrittenManifest =
+                    rewriteDashManifest(
+                        manifestText,
+                        targetUrl.toString(),
+                        proxyBaseUrl
+                    );
+
+            } else {
+
+                rewrittenManifest =
+                    rewriteHlsManifest(
+                        manifestText,
+                        targetUrl.toString(),
+                        proxyBaseUrl
+                    );
+            }
+
+
+            /*
+             * Manifest has been changed.
+             *
+             * Remove original compression and
+             * length headers.
+             */
+
+            responseHeaders.delete(
+                'content-encoding'
+            );
+
+            responseHeaders.delete(
+                'content-length'
+            );
+
+
+            /*
+             * Correct content type.
+             */
+
+            if (
+                targetUrl.pathname
+                    .toLowerCase()
+                    .endsWith('.mpd')
+            ) {
+
+                responseHeaders.set(
+                    'Content-Type',
+                    'application/dash+xml'
+                );
+
+            } else if (
+                targetUrl.pathname
+                    .toLowerCase()
+                    .endsWith('.m3u8')
+            ) {
+
+                responseHeaders.set(
+                    'Content-Type',
+                    'application/vnd.apple.mpegurl'
+                );
+            }
+
+
+            return new NextResponse(
+                rewrittenManifest,
+                {
+                    status:
+                        upstreamResponse.status,
+
+                    statusText:
+                        upstreamResponse.statusText,
+
+                    headers:
+                        responseHeaders,
+                }
+            );
         }
 
-        const cors = corsHeaders();
-        for (const [key, value] of Object.entries(cors)) {
-            responseHeaders.set(key, value);
-        }
 
-        // Check if the response is a manifest file (.mpd or .m3u8)
-        const isManifest = 
-            targetUrl.pathname.endsWith('.mpd') ||
-            targetUrl.pathname.endsWith('.m3u8') ||
-            upstreamContentType.includes('xml') ||
-            upstreamContentType.includes('dash') ||
-            upstreamContentType.includes('mpegurl');
+        /* =====================================================
+           BINARY STREAM / SEGMENT
+        ===================================================== */
 
-        if (isManifest) {
-            const manifestText = await upstreamResponse.text();
-            
-            const host = req.headers.get('host') || 'your-project.vercel.app';
-            const protocol = req.headers.get('x-forwarded-proto') || 'https';
-            const proxyBaseUrl = `${protocol}://${host}/api/proxy/`;
+        /*
+         * Do NOT call .text() here.
+         *
+         * Stream the binary response directly.
+         */
 
-            const rewrittenManifest = rewriteManifestContent(manifestText, targetUrl.toString(), proxyBaseUrl);
+        return new NextResponse(
+            upstreamResponse.body,
+            {
+                status:
+                    upstreamResponse.status,
 
-            responseHeaders.delete('content-encoding');
-            responseHeaders.set('content-length', Buffer.byteLength(rewrittenManifest));
+                statusText:
+                    upstreamResponse.statusText,
 
-            return new NextResponse(rewrittenManifest, {
-                status: upstreamResponse.status,
-                statusText: upstreamResponse.statusText,
-                headers: responseHeaders,
-            });
-        }
+                headers:
+                    responseHeaders,
+            }
+        );
 
-        // Stream regular binary chunks (.m4s, .ts segments) directly
-        return new NextResponse(upstreamResponse.body, {
-            status: upstreamResponse.status,
-            statusText: upstreamResponse.statusText,
-            headers: responseHeaders,
-        });
 
     } catch (error) {
-        console.error('CORS Proxy Error:', error);
+
+        console.error(
+            'CORS Proxy Error:',
+            error
+        );
+
+
         return NextResponse.json(
-            { error: 'Proxy fetch failed', details: error instanceof Error ? error.message : String(error) },
-            { status: 502, headers: corsHeaders() }
+            {
+                error:
+                    'Proxy fetch failed',
+
+                details:
+                    error instanceof Error
+                        ? error.message
+                        : String(error),
+            },
+            {
+                status: 502,
+                headers:
+                    corsHeaders(),
+            }
         );
     }
 }
 
-export async function GET(req) { return handleProxy(req); }
-export async function HEAD(req) { return handleProxy(req); }
-export async function POST(req) { return handleProxy(req); }
-export async function PUT(req) { return handleProxy(req); }
-export async function DELETE(req) { return handleProxy(req); }
+
+/* =========================================================
+   HTTP METHODS
+========================================================= */
+
+export async function GET(req) {
+
+    return handleProxy(req);
+}
+
+
+export async function HEAD(req) {
+
+    return handleProxy(req);
+}
+
+
+export async function POST(req) {
+
+    return handleProxy(req);
+}
+
+
+export async function PUT(req) {
+
+    return handleProxy(req);
+}
+
+
+export async function DELETE(req) {
+
+    return handleProxy(req);
+}
+
+
+/* =========================================================
+   CORS PREFLIGHT
+========================================================= */
+
 export async function OPTIONS() {
-    return new NextResponse(null, { status: 204, headers: corsHeaders() });
+
+    return new NextResponse(
+        null,
+        {
+            status: 204,
+
+            headers:
+                corsHeaders(),
+        }
+    );
 }

@@ -9,12 +9,14 @@ async function handleProxy(req) {
         return NextResponse.json({ error: 'Missing target URL' }, { status: 400 });
     }
 
+    // Handle malformed URL slashes resulting from routing
     if (rawTarget.startsWith('http:/') && !rawTarget.startsWith('http://')) {
         rawTarget = rawTarget.replace('http:/', 'http://');
     } else if (rawTarget.startsWith('https:/') && !rawTarget.startsWith('https://')) {
         rawTarget = rawTarget.replace('https:/', 'https://');
     }
 
+    // Append query strings if present
     const searchParams = req.nextUrl.search;
     if (searchParams) {
         rawTarget += searchParams;
@@ -24,14 +26,14 @@ async function handleProxy(req) {
         const targetUrlObj = new URL(rawTarget);
         const targetOrigin = `${targetUrlObj.protocol}//${targetUrlObj.host}`;
 
-        // Capture headers from the incoming request or use smart fallbacks
         const clientUserAgent = req.headers.get('user-agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
         const clientReferer = req.headers.get('referer') || targetOrigin + '/';
         const clientOrigin = req.headers.get('origin') || targetOrigin;
 
-        // Fetch from target streaming server while forwarding/managing headers
+        // Fetch target URL and explicitly tell it to follow redirects safely server-side
         const apiResponse = await fetch(rawTarget, {
             method: req.method,
+            redirect: 'follow', 
             headers: {
                 'User-Agent': clientUserAgent,
                 'Referer': clientReferer,
@@ -47,7 +49,7 @@ async function handleProxy(req) {
         const contentRange = apiResponse.headers.get('content-range');
         if (contentRange) responseHeaders.set('Content-Range', contentRange);
 
-        // Permissive CORS headers for your video player
+        // Permissive CORS headers
         responseHeaders.set('Access-Control-Allow-Origin', '*');
         responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         responseHeaders.set('Access-Control-Allow-Headers', '*');

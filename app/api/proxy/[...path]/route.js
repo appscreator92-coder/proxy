@@ -64,7 +64,6 @@ function corsHeaders() {
 function rewriteManifestContent(manifestText, targetUrl, proxyBaseUrl) {
     const targetBase = new URL('.', targetUrl).toString();
 
-    // Helper to turn relative/absolute segment links into proxied links
     const makeProxiedUrl = (originalLink) => {
         let absoluteUrl;
         try {
@@ -75,30 +74,24 @@ function rewriteManifestContent(manifestText, targetUrl, proxyBaseUrl) {
         return `${proxyBaseUrl}${absoluteUrl}`;
     };
 
-    // 1. DASH (.mpd) Manifest Rewriting (media="...", initialization="...", sourceURL="...")
+    // 1. DASH (.mpd) Manifest Rewriting
     let rewritten = manifestText.replace(
         /(media|initialization|sourceURL)=["']([^"']+)["']/g,
         (match, attr, link) => {
-            if (link.startsWith('http://') || link.startsWith('https://') || link.startsWith('/')) {
-                // If it's already an absolute URL or absolute path, proxy it
-                return `${attr}="${makeProxiedUrl(link)}"`;
-            }
             return `${attr}="${makeProxiedUrl(link)}"`;
         }
     );
 
-    // 2. HLS (.m3u8) Manifest Rewriting (lines that aren't tags starting with #)
+    // 2. HLS (.m3u8) Manifest Rewriting
     const lines = rewritten.split('\n');
     const processedLines = lines.map((line) => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith('#')) {
-            // Check for URI inside tags like #EXT-X-MAP:URI="..." or #EXT-X-STREAM-INF
             if (trimmed.includes('URI="')) {
                 return trimmed.replace(/URI="([^"]+)"/, (m, uri) => `URI="${makeProxiedUrl(uri)}"`);
             }
             return line;
         }
-        // This is a media segment line (e.g., segment_1.ts)
         return makeProxiedUrl(trimmed);
     });
 
@@ -107,7 +100,12 @@ function rewriteManifestContent(manifestText, targetUrl, proxyBaseUrl) {
 
 async function handleProxy(req) {
     try {
-        const rawTarget = getTargetFromPath(req);
+        let rawTarget = getTargetFromPath(req);
+
+        // Crucial: Append query parameters (tokens, keys, etc.) back onto the target URL
+        if (req.nextUrl.search) {
+            rawTarget += req.nextUrl.search;
+        }
 
         if (!rawTarget) {
             return NextResponse.json({ error: 'Missing target URL' }, { status: 400, headers: corsHeaders() });
@@ -178,7 +176,7 @@ async function handleProxy(req) {
             responseHeaders.set(key, value);
         }
 
-        // Check if the response is a manifest file (.mpd, .m3u8, or text/xml/playlist format)
+        // Check if the response is a manifest file (.mpd or .m3u8)
         const isManifest = 
             targetUrl.pathname.endsWith('.mpd') ||
             targetUrl.pathname.endsWith('.m3u8') ||
@@ -189,14 +187,12 @@ async function handleProxy(req) {
         if (isManifest) {
             const manifestText = await upstreamResponse.text();
             
-            // Build the current proxy base URL dynamically from the request headers
             const host = req.headers.get('host') || 'your-project.vercel.app';
             const protocol = req.headers.get('x-forwarded-proto') || 'https';
             const proxyBaseUrl = `${protocol}://${host}/api/proxy/`;
 
             const rewrittenManifest = rewriteManifestContent(manifestText, targetUrl.toString(), proxyBaseUrl);
 
-            // Remove content-encoding since we modified the plain text body length/content
             responseHeaders.delete('content-encoding');
             responseHeaders.set('content-length', Buffer.byteLength(rewrittenManifest));
 
@@ -207,7 +203,7 @@ async function handleProxy(req) {
             });
         }
 
-        // For regular binary chunks (.m4s, .ts segments, keys, etc.), stream directly
+        // Stream regular binary chunks (.m4s, .ts segments) directly
         return new NextResponse(upstreamResponse.body, {
             status: upstreamResponse.status,
             statusText: upstreamResponse.statusText,

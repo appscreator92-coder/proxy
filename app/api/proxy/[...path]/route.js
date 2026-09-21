@@ -21,36 +21,39 @@ async function handleProxy(req) {
     }
 
     try {
-        // Extract target domain to use as a spoofed referer if needed
         const targetUrlObj = new URL(rawTarget);
         const targetOrigin = `${targetUrlObj.protocol}//${targetUrlObj.host}`;
 
+        // Fetch from target streaming server
         const apiResponse = await fetch(rawTarget, {
             method: req.method,
             headers: {
-                // Provide a standard desktop browser user agent
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                // Provide a referer matching the target streaming domain to bypass 403 blocks
                 'Referer': targetOrigin + '/',
             },
         });
 
-        const data = await apiResponse.arrayBuffer();
+        // Create response headers matching the target stream
+        const responseHeaders = new Headers();
+        
+        // Pass vital content headers through
+        const contentType = apiResponse.headers.get('content-type');
+        if (contentType) responseHeaders.set('Content-Type', contentType);
+        
+        const contentRange = apiResponse.headers.get('content-range');
+        if (contentRange) responseHeaders.set('Content-Range', contentRange);
 
-        const response = new NextResponse(data, {
+        // Attach permissive CORS headers
+        responseHeaders.set('Access-Control-Allow-Origin', '*');
+        responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+        responseHeaders.set('Access-Control-Allow-Headers', '*');
+
+        // Stream the response body directly back (crucial for video chunks/playlists)
+        return new NextResponse(apiResponse.body, {
             status: apiResponse.status,
+            headers: responseHeaders,
         });
 
-        response.headers.set('Access-Control-Allow-Origin', '*');
-        response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        response.headers.set('Access-Control-Allow-Headers', '*');
-
-        const contentType = apiResponse.headers.get('content-type');
-        if (contentType) {
-            response.headers.set('Content-Type', contentType);
-        }
-
-        return response;
     } catch (error) {
         return NextResponse.json({ error: 'Proxy fetch failed', details: error.message }, { status: 500 });
     }

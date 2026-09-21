@@ -14,23 +14,15 @@ const DEFAULT_UA =
 
 /*
  * IMPORTANT:
- * Add only domains that you are authorized to proxy.
- *
- * Example:
- *
- * const ALLOWED_HOSTS = new Set([
- *     'https://livestream2.sunnxt.com',
-       'https://livestream.sunnxt.com',
-       'https://livestream3.sunnxt.com',
- *     'https://livestream1.sunnxt.com',
- * ]);
- *
- * If you use multiple subdomains, add them individually.
+ * Add your streaming domains here so the security check 
+ * allows them through.
  */
 
 const ALLOWED_HOSTS = new Set([
-    'your-domain.com',
-    'cdn.your-domain.com',
+    'livestream1.sunnxt.com',
+    'livestream.sunnxt.com',
+    'sunnxt.com',
+    'livestream2.sunnxt.com',
 ]);
 
 
@@ -63,7 +55,7 @@ function corsHeaders() {
 function getTargetFromPath(req) {
 
     const pathname = req.nextUrl.pathname;
-
+    const search = req.nextUrl.search; // Capture search/query parameters (tokens, keys)
     const prefix = '/api/proxy/';
 
     if (!pathname.startsWith(prefix)) {
@@ -87,12 +79,7 @@ function getTargetFromPath(req) {
 
     /*
      * Repair routing that changed:
-     *
-     * https://
-     *
-     * into:
-     *
-     * https:/
+     * https:// into https:/
      */
 
     if (
@@ -113,6 +100,13 @@ function getTargetFromPath(req) {
             /^http:\//,
             'http://'
         );
+    }
+
+    /*
+     * Append query parameters back onto the target URL
+     */
+    if (search) {
+        rawTarget += search;
     }
 
     return rawTarget;
@@ -214,12 +208,7 @@ function createProxyUrl(
 
         /*
          * Encode target so characters such as:
-         *
-         * ?
-         * &
-         * =
-         *
-         * do not break the proxy route.
+         * ? & = do not break the proxy route.
          */
 
         return (
@@ -244,9 +233,6 @@ function rewriteDashManifest(
     proxyBaseUrl
 ) {
 
-    /*
-     * Directory containing the MPD.
-     */
     const baseUrl =
         new URL(
             './',
@@ -254,18 +240,11 @@ function rewriteDashManifest(
         ).toString();
 
 
-    /*
-     * MPD attributes that commonly contain URLs.
-     */
-
     manifest = manifest.replace(
         /\b(media|initialization|sourceURL|index|indexRange)=["']([^"']+)["']/gi,
 
         (match, attribute, value) => {
 
-            /*
-             * indexRange is NOT a URL.
-             */
             if (
                 attribute.toLowerCase() ===
                 'indexrange'
@@ -284,14 +263,6 @@ function rewriteDashManifest(
         }
     );
 
-
-    /*
-     * Handle BaseURL elements.
-     *
-     * Example:
-     *
-     * <BaseURL>video/</BaseURL>
-     */
 
     manifest = manifest.replace(
         /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/gi,
@@ -333,10 +304,6 @@ function rewriteHlsManifest(
     proxyBaseUrl
 ) {
 
-    /*
-     * HLS base directory.
-     */
-
     const baseUrl =
         new URL(
             './',
@@ -353,33 +320,11 @@ function rewriteHlsManifest(
         const trimmed =
             line.trim();
 
-
-        /*
-         * Empty line.
-         */
-
         if (!trimmed) {
             return line;
         }
 
-
-        /*
-         * EXT-X tags.
-         */
-
         if (trimmed.startsWith('#')) {
-
-            /*
-             * URI="..."
-             *
-             * Used by:
-             *
-             * EXT-X-KEY
-             * EXT-X-MAP
-             * EXT-X-MEDIA
-             * EXT-X-I-FRAME-STREAM-INF
-             * etc.
-             */
 
             return line.replace(
                 /URI="([^"]+)"/gi,
@@ -397,11 +342,6 @@ function rewriteHlsManifest(
                 }
             );
         }
-
-
-        /*
-         * Normal HLS segment / playlist URL.
-         */
 
         return createProxyUrl(
             trimmed,
@@ -430,22 +370,12 @@ function isManifest(
     const type =
         contentType.toLowerCase();
 
-
-    /*
-     * File extension.
-     */
-
     if (
         pathname.endsWith('.mpd') ||
         pathname.endsWith('.m3u8')
     ) {
         return true;
     }
-
-
-    /*
-     * Content-Type.
-     */
 
     if (
         type.includes('mpegurl') ||
@@ -456,7 +386,6 @@ function isManifest(
     ) {
         return true;
     }
-
 
     return false;
 }
@@ -473,11 +402,6 @@ async function handleProxy(req) {
         let rawTarget =
             getTargetFromPath(req);
 
-
-        /*
-         * Validate target.
-         */
-
         if (!rawTarget) {
 
             return NextResponse.json(
@@ -493,13 +417,7 @@ async function handleProxy(req) {
             );
         }
 
-
         let targetUrl;
-
-
-        /*
-         * Parse target.
-         */
 
         try {
 
@@ -524,11 +442,6 @@ async function handleProxy(req) {
             );
         }
 
-
-        /*
-         * Only HTTP/HTTPS.
-         */
-
         if (
             targetUrl.protocol !==
                 'http:' &&
@@ -549,13 +462,6 @@ async function handleProxy(req) {
                 }
             );
         }
-
-
-        /*
-         * SECURITY:
-         *
-         * Only proxy authorized hosts.
-         */
 
         if (
             !isAllowedHost(
@@ -579,34 +485,18 @@ async function handleProxy(req) {
             );
         }
 
-
-        /* =====================================================
-           UPSTREAM REQUEST HEADERS
-        ===================================================== */
-
         const upstreamHeaders =
             new Headers();
-
-
-        /*
-         * User-Agent.
-         */
 
         const userAgent =
             req.headers.get(
                 'user-agent'
             ) || DEFAULT_UA;
 
-
         upstreamHeaders.set(
             'User-Agent',
             userAgent
         );
-
-
-        /*
-         * Accept.
-         */
 
         upstreamHeaders.set(
             'Accept',
@@ -615,27 +505,16 @@ async function handleProxy(req) {
             ) || '*/*'
         );
 
-
-        /*
-         * Referer.
-         */
-
         const referer =
             req.headers.get(
                 'referer'
             ) ||
             `${targetUrl.origin}/`;
 
-
         upstreamHeaders.set(
             'Referer',
             referer
         );
-
-
-        /*
-         * Origin.
-         */
 
         const origin =
             req.headers.get(
@@ -650,18 +529,6 @@ async function handleProxy(req) {
             );
         }
 
-
-        /*
-         * Range.
-         *
-         * Important for:
-         *
-         * DASH
-         * MP4
-         * fMP4
-         * seeking
-         */
-
         const range =
             req.headers.get(
                 'range'
@@ -674,11 +541,6 @@ async function handleProxy(req) {
                 range
             );
         }
-
-
-        /*
-         * Authorization.
-         */
 
         const authorization =
             req.headers.get(
@@ -693,11 +555,6 @@ async function handleProxy(req) {
             );
         }
 
-
-        /*
-         * Content-Type.
-         */
-
         const requestContentType =
             req.headers.get(
                 'content-type'
@@ -710,11 +567,6 @@ async function handleProxy(req) {
                 requestContentType
             );
         }
-
-
-        /* =====================================================
-           FETCH OPTIONS
-        ===================================================== */
 
         const fetchOptions = {
 
@@ -732,11 +584,6 @@ async function handleProxy(req) {
 
         };
 
-
-        /*
-         * Forward body for non-GET requests.
-         */
-
         if (
             req.method !== 'GET' &&
             req.method !== 'HEAD' &&
@@ -747,37 +594,21 @@ async function handleProxy(req) {
                 await req.arrayBuffer();
         }
 
-
-        /* =====================================================
-           FETCH UPSTREAM
-        ===================================================== */
-
         const upstreamResponse =
             await fetch(
                 targetUrl.toString(),
                 fetchOptions
             );
 
-
         const contentType =
             upstreamResponse.headers.get(
                 'content-type'
             ) || '';
 
-
-        /* =====================================================
-           RESPONSE HEADERS
-        ===================================================== */
-
         const responseHeaders =
             copyResponseHeaders(
                 upstreamResponse.headers
             );
-
-
-        /* =====================================================
-           MANIFEST HANDLING
-        ===================================================== */
 
         if (
             isManifest(
@@ -786,23 +617,13 @@ async function handleProxy(req) {
             )
         ) {
 
-            /*
-             * Read manifest as text.
-             */
-
             const manifestText =
                 await upstreamResponse.text();
-
-
-            /*
-             * Determine public proxy URL.
-             */
 
             const host =
                 req.headers.get(
                     'host'
                 );
-
 
             if (!host) {
 
@@ -819,7 +640,6 @@ async function handleProxy(req) {
                 );
             }
 
-
             const protocol =
                 req.headers.get(
                     'x-forwarded-proto'
@@ -829,17 +649,10 @@ async function handleProxy(req) {
                     'https:'
                 ).replace(':', '');
 
-
             const proxyBaseUrl =
                 `${protocol}://${host}/api/proxy/`;
 
-
             let rewrittenManifest;
-
-
-            /*
-             * Select DASH or HLS.
-             */
 
             if (
                 targetUrl.pathname
@@ -867,14 +680,6 @@ async function handleProxy(req) {
                     );
             }
 
-
-            /*
-             * Manifest has been changed.
-             *
-             * Remove original compression and
-             * length headers.
-             */
-
             responseHeaders.delete(
                 'content-encoding'
             );
@@ -882,11 +687,6 @@ async function handleProxy(req) {
             responseHeaders.delete(
                 'content-length'
             );
-
-
-            /*
-             * Correct content type.
-             */
 
             if (
                 targetUrl.pathname
@@ -911,7 +711,6 @@ async function handleProxy(req) {
                 );
             }
 
-
             return new NextResponse(
                 rewrittenManifest,
                 {
@@ -927,17 +726,6 @@ async function handleProxy(req) {
             );
         }
 
-
-        /* =====================================================
-           BINARY STREAM / SEGMENT
-        ===================================================== */
-
-        /*
-         * Do NOT call .text() here.
-         *
-         * Stream the binary response directly.
-         */
-
         return new NextResponse(
             upstreamResponse.body,
             {
@@ -952,14 +740,12 @@ async function handleProxy(req) {
             }
         );
 
-
     } catch (error) {
 
         console.error(
             'CORS Proxy Error:',
             error
         );
-
 
         return NextResponse.json(
             {
@@ -986,31 +772,22 @@ async function handleProxy(req) {
 ========================================================= */
 
 export async function GET(req) {
-
     return handleProxy(req);
 }
-
 
 export async function HEAD(req) {
-
     return handleProxy(req);
 }
-
 
 export async function POST(req) {
-
     return handleProxy(req);
 }
-
 
 export async function PUT(req) {
-
     return handleProxy(req);
 }
 
-
 export async function DELETE(req) {
-
     return handleProxy(req);
 }
 
@@ -1020,12 +797,10 @@ export async function DELETE(req) {
 ========================================================= */
 
 export async function OPTIONS() {
-
     return new NextResponse(
         null,
         {
             status: 204,
-
             headers:
                 corsHeaders(),
         }

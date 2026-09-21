@@ -1,533 +1,150 @@
-import { NextResponse } from 'next/server';
+export default {
+	async fetch(request) {
+		const corsHeaders = {
+			"Access-Control-Allow-Origin": "*",
+			"Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+			"Access-Control-Max-Age": "86400",
+		};
 
-export const dynamic = 'force-dynamic';
-export const runtime = 'nodejs';
+		// The URL for the remote third party API you want to fetch from
+		// but does not implement CORS
+		const API_URL = "https://examples.cloudflareworkers.com/demos/demoapi";
 
-/* =========================================================
-   CONFIGURATION
-========================================================= */
+		// The endpoint you want the CORS reverse proxy to be on
+		const PROXY_ENDPOINT = "/corsproxy/";
 
-const DEFAULT_UA =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-    'Chrome/122.0.0.0 Safari/537.36';
+		// The rest of this snippet for the demo page
+		function rawHtmlResponse(html) {
+			return new Response(html, {
+				headers: {
+					"content-type": "text/html;charset=UTF-8",
+				},
+			});
+		}
 
-/*
- * IMPORTANT:
- * Add your streaming domains here so the security check 
- * allows them through.
- */
-
-const ALLOWED_HOSTS = new Set([
-    'your-domain.com',
-    'cdn.your-domain.com',
-    'sunnxt.com',
-    'livestream2.sunnxt.com',
-]);
-
-
-/* =========================================================
-   CORS HEADERS
-========================================================= */
-
-function corsHeaders() {
-    return {
-        'Access-Control-Allow-Origin': '*',
-
-        'Access-Control-Allow-Methods':
-            'GET, HEAD, POST, PUT, DELETE, OPTIONS',
-
-        'Access-Control-Allow-Headers':
-            'Range, Accept, Content-Type, Origin, Referer, User-Agent, Authorization',
-
-        'Access-Control-Expose-Headers':
-            'Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified',
-
-        'Access-Control-Max-Age': '86400',
-    };
-}
-
-
-/* =========================================================
-   GET TARGET URL
-========================================================= */
-
-function getTargetFromPath(req) {
-    const pathname = req.nextUrl.pathname;
-    const search = req.nextUrl.search; // Capture search/query parameters (tokens, keys)
-    const prefix = '/api/proxy/';
-
-    if (!pathname.startsWith(prefix)) {
-        return null;
-    }
-
-    let rawTarget = pathname.slice(prefix.length);
-
-    if (!rawTarget) {
-        return null;
-    }
-
-    /*
-     * Safely decode URL-encoded target if it contains encoded characters.
-     */
-    if (rawTarget.includes('%')) {
-        try {
-            rawTarget = decodeURIComponent(rawTarget);
-        } catch {
-            // Keep original value if decoding fails.
+		const DEMO_PAGE = `
+      <!DOCTYPE html>
+      <html>
+      <body>
+        <h1>API GET without CORS Proxy</h1>
+        <a target="_blank" href="https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#Checking_that_the_fetch_was_successful">Shows TypeError: Failed to fetch since CORS is misconfigured</a>
+        <p id="noproxy-status"/>
+        <code id="noproxy">Waiting</code>
+        <h1>API GET with CORS Proxy</h1>
+        <p id="proxy-status"/>
+        <code id="proxy">Waiting</code>
+        <h1>API POST with CORS Proxy + Preflight</h1>
+        <p id="proxypreflight-status"/>
+        <code id="proxypreflight">Waiting</code>
+        <script>
+        let reqs = {};
+        reqs.noproxy = () => {
+          return fetch("${API_URL}").then(r => r.json())
         }
-    }
-
-    /*
-     * Repair routing that compressed protocol slashes:
-     * https:/ into https://
-     */
-    rawTarget = rawTarget
-        .replace(/^https:\/+/, 'https://')
-        .replace(/^http:\/+/, 'http://');
-
-    /*
-     * Append query parameters back onto the target URL
-     */
-    if (search) {
-        rawTarget += search;
-    }
-
-    return rawTarget;
-}
-
-
-/* =========================================================
-   HOST VALIDATION
-========================================================= */
-
-function isAllowedHost(hostname) {
-    hostname = hostname.toLowerCase();
-    return ALLOWED_HOSTS.has(hostname);
-}
-
-
-/* =========================================================
-   COPY RESPONSE HEADERS
-========================================================= */
-
-function copyResponseHeaders(upstreamHeaders) {
-    const headers = new Headers();
-
-    const allowedHeaders = [
-        'content-type',
-        'content-length',
-        'content-range',
-        'accept-ranges',
-        'cache-control',
-        'etag',
-        'last-modified',
-        'expires',
-        'content-encoding',
-        'content-disposition',
-        'vary',
-    ];
-
-    for (const name of allowedHeaders) {
-        const value = upstreamHeaders.get(name);
-        if (value) {
-            headers.set(name, value);
+        reqs.proxy = async () => {
+          let href = "${PROXY_ENDPOINT}?apiurl=${API_URL}"
+          return fetch(window.location.origin + href).then(r => r.json())
         }
-    }
-
-    /*
-     * Add CORS headers.
-     */
-    const cors = corsHeaders();
-    for (const [key, value] of Object.entries(cors)) {
-        headers.set(key, value);
-    }
-
-    return headers;
-}
-
-
-/* =========================================================
-   MAKE PROXY URL
-========================================================= */
-
-function createProxyUrl(
-    originalUrl,
-    baseUrl,
-    proxyBaseUrl
-) {
-    try {
-        const absoluteUrl = new URL(
-            originalUrl,
-            baseUrl
-        ).toString();
-
-        return (
-            proxyBaseUrl +
-            encodeURIComponent(absoluteUrl)
-        );
-    } catch {
-        return originalUrl;
-    }
-}
-
-
-/* =========================================================
-   REWRITE DASH MANIFEST
-========================================================= */
-
-function rewriteDashManifest(
-    manifest,
-    targetUrl,
-    proxyBaseUrl
-) {
-    const baseUrl = new URL(
-        './',
-        targetUrl
-    ).toString();
-
-    manifest = manifest.replace(
-        /\b(media|initialization|sourceURL|index|indexRange)=["']([^"']+)["']/gi,
-        (match, attribute, value) => {
-            if (attribute.toLowerCase() === 'indexrange') {
-                return match;
-            }
-
-            const proxied = createProxyUrl(
-                value,
-                baseUrl,
-                proxyBaseUrl
-            );
-
-            return `${attribute}="${proxied}"`;
-        }
-    );
-
-    manifest = manifest.replace(
-        /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/gi,
-        (match, start, value, end) => {
-            const trimmed = value.trim();
-            if (!trimmed) {
-                return match;
-            }
-
-            const proxied = createProxyUrl(
-                trimmed,
-                baseUrl,
-                proxyBaseUrl
-            );
-
-            return `${start}${proxied}${end}`;
-        }
-    );
-
-    return manifest;
-}
-
-
-/* =========================================================
-   REWRITE HLS MANIFEST
-========================================================= */
-
-function rewriteHlsManifest(
-    manifest,
-    targetUrl,
-    proxyBaseUrl
-) {
-    const baseUrl = new URL(
-        './',
-        targetUrl
-    ).toString();
-
-    const lines = manifest.split(/\r?\n/);
-
-    const result = lines.map(line => {
-        const trimmed = line.trim();
-
-        if (!trimmed) {
-            return line;
-        }
-
-        if (trimmed.startsWith('#')) {
-            return line.replace(
-                /URI="([^"]+)"/gi,
-                (match, uri) => {
-                    const proxied = createProxyUrl(
-                        uri,
-                        baseUrl,
-                        proxyBaseUrl
-                    );
-                    return `URI="${proxied}"`;
-                }
-            );
-        }
-
-        return createProxyUrl(
-            trimmed,
-            baseUrl,
-            proxyBaseUrl
-        );
-    });
-
-    return result.join('\n');
-}
-
-
-/* =========================================================
-   DETECT MANIFEST
-========================================================= */
-
-function isManifest(targetUrl, contentType) {
-    const pathname = targetUrl.pathname.toLowerCase();
-    const type = contentType.toLowerCase();
-
-    if (
-        pathname.endsWith('.mpd') ||
-        pathname.endsWith('.m3u8')
-    ) {
-        return true;
-    }
-
-    if (
-        type.includes('mpegurl') ||
-        type.includes('vnd.apple.mpegurl') ||
-        type.includes('dash+xml') ||
-        type.includes('application/xml') ||
-        type.includes('text/xml')
-    ) {
-        return true;
-    }
-
-    return false;
-}
-
-
-/* =========================================================
-   MAIN PROXY
-========================================================= */
-
-async function handleProxy(req) {
-    try {
-        let rawTarget = getTargetFromPath(req);
-
-        if (!rawTarget) {
-            return NextResponse.json(
-                { error: 'Missing target URL' },
-                { status: 400, headers: corsHeaders() }
-            );
-        }
-
-        let targetUrl;
-        try {
-            targetUrl = new URL(rawTarget);
-        } catch {
-            return NextResponse.json(
-                { error: 'Invalid target URL', target: rawTarget },
-                { status: 400, headers: corsHeaders() }
-            );
-        }
-
-        if (
-            targetUrl.protocol !== 'http:' &&
-            targetUrl.protocol !== 'https:'
-        ) {
-            return NextResponse.json(
-                { error: 'Only HTTP and HTTPS URLs are allowed' },
-                { status: 400, headers: corsHeaders() }
-            );
-        }
-
-        if (!isAllowedHost(targetUrl.hostname)) {
-            return NextResponse.json(
-                { error: 'Target host is not allowed', host: targetUrl.hostname },
-                { status: 403, headers: corsHeaders() }
-            );
-        }
-
-        const upstreamHeaders = new Headers();
-
-        const userAgent =
-            req.headers.get('user-agent') || DEFAULT_UA;
-        upstreamHeaders.set('User-Agent', userAgent);
-        upstreamHeaders.set(
-            'Accept',
-            req.headers.get('accept') || '*/*'
-        );
-
-        const referer =
-            req.headers.get('referer') ||
-            `${targetUrl.origin}/`;
-        upstreamHeaders.set('Referer', referer);
-
-        const origin = req.headers.get('origin');
-        if (origin) {
-            upstreamHeaders.set('Origin', origin);
-        }
-
-        const range = req.headers.get('range');
-        if (range) {
-            upstreamHeaders.set('Range', range);
-        }
-
-        const authorization = req.headers.get('authorization');
-        if (authorization) {
-            upstreamHeaders.set('Authorization', authorization);
-        }
-
-        const requestContentType = req.headers.get('content-type');
-        if (requestContentType) {
-            upstreamHeaders.set('Content-Type', requestContentType);
-        }
-
-        const fetchOptions = {
-            method: req.method,
-            headers: upstreamHeaders,
-            redirect: 'follow',
-            cache: 'no-store',
-        };
-
-        if (
-            req.method !== 'GET' &&
-            req.method !== 'HEAD' &&
-            req.method !== 'OPTIONS'
-        ) {
-            fetchOptions.body = await req.arrayBuffer();
-        }
-
-        const upstreamResponse = await fetch(
-            targetUrl.toString(),
-            fetchOptions
-        );
-
-        const contentType =
-            upstreamResponse.headers.get('content-type') || '';
-
-        const responseHeaders = copyResponseHeaders(
-            upstreamResponse.headers
-        );
-
-        if (isManifest(targetUrl, contentType)) {
-            const manifestText = await upstreamResponse.text();
-
-            const host = req.headers.get('host');
-            if (!host) {
-                return NextResponse.json(
-                    { error: 'Unable to determine proxy host' },
-                    { status: 500, headers: corsHeaders() }
-                );
-            }
-
-            const protocol =
-                req.headers.get('x-forwarded-proto') ||
-                (req.nextUrl.protocol || 'https:').replace(':', '');
-
-            const proxyBaseUrl = `${protocol}://${host}/api/proxy/`;
-
-            let rewrittenManifest;
-
-            if (
-                targetUrl.pathname
-                    .toLowerCase()
-                    .endsWith('.mpd') ||
-                contentType.toLowerCase().includes('dash+xml')
-            ) {
-                rewrittenManifest = rewriteDashManifest(
-                    manifestText,
-                    targetUrl.toString(),
-                    proxyBaseUrl
-                );
-            } else {
-                rewrittenManifest = rewriteHlsManifest(
-                    manifestText,
-                    targetUrl.toString(),
-                    proxyBaseUrl
-                );
-            }
-
-            responseHeaders.delete('content-encoding');
-            responseHeaders.delete('content-length');
-
-            if (
-                targetUrl.pathname.toLowerCase().endsWith('.mpd')
-            ) {
-                responseHeaders.set(
-                    'Content-Type',
-                    'application/dash+xml'
-                );
-            } else if (
-                targetUrl.pathname.toLowerCase().endsWith('.m3u8')
-            ) {
-                responseHeaders.set(
-                    'Content-Type',
-                    'application/vnd.apple.mpegurl'
-                );
-            }
-
-            return new NextResponse(rewrittenManifest, {
-                status: upstreamResponse.status,
-                statusText: upstreamResponse.statusText,
-                headers: responseHeaders,
-            });
-        }
-
-        return new NextResponse(upstreamResponse.body, {
-            status: upstreamResponse.status,
-            statusText: upstreamResponse.statusText,
-            headers: responseHeaders,
-        });
-
-    } catch (error) {
-        console.error('CORS Proxy Error:', error);
-
-        return NextResponse.json(
-            {
-                error: 'Proxy fetch failed',
-                details:
-                    error instanceof Error
-                        ? error.message
-                        : String(error),
+        reqs.proxypreflight = async () => {
+          let href = "${PROXY_ENDPOINT}?apiurl=${API_URL}"
+          let response = await fetch(window.location.origin + href, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
             },
-            {
-                status: 502,
-                headers: corsHeaders(),
-            }
-        );
-    }
-}
+            body: JSON.stringify({
+              msg: "Hello world!"
+            })
+          })
+          return response.json()
+        }
+        (async () => {
+        for (const [reqName, req] of Object.entries(reqs)) {
+          try {
+            let data = await req()
+            document.getElementById(reqName).innerHTML = JSON.stringify(data)
+          } catch (e) {
+            document.getElementById(reqName).innerHTML = e
+          }
+        }
+      })()
+        </script>
+      </body>
+      </html>
+    `;
 
+		async function handleRequest(request) {
+			const url = new URL(request.url);
+			let apiUrl = url.searchParams.get("apiurl");
 
-/* =========================================================
-   HTTP METHODS
-========================================================= */
+			if (apiUrl == null) {
+				apiUrl = API_URL;
+			}
 
-export async function GET(req) {
-    return handleProxy(req);
-}
+			// Rewrite request to point to API URL. This also makes the request mutable
+			// so you can add the correct Origin header to make the API server think
+			// that this request is not cross-site.
+			request = new Request(apiUrl, request);
+			request.headers.set("Origin", new URL(apiUrl).origin);
+			let response = await fetch(request);
+			// Recreate the response so you can modify the headers
 
-export async function HEAD(req) {
-    return handleProxy(req);
-}
+			response = new Response(response.body, response);
+			// Set CORS headers
 
-export async function POST(req) {
-    return handleProxy(req);
-}
+			response.headers.set("Access-Control-Allow-Origin", url.origin);
 
-export async function PUT(req) {
-    return handleProxy(req);
-}
+			// Append to/Add Vary header so browser will cache response correctly
+			response.headers.append("Vary", "Origin");
 
-export async function DELETE(req) {
-    return handleProxy(req);
-}
+			return response;
+		}
 
+		async function handleOptions(request) {
+			if (
+				request.headers.get("Origin") !== null &&
+				request.headers.get("Access-Control-Request-Method") !== null &&
+				request.headers.get("Access-Control-Request-Headers") !== null
+			) {
+				// Handle CORS preflight requests.
+				return new Response(null, {
+					headers: {
+						...corsHeaders,
+						"Access-Control-Allow-Headers": request.headers.get(
+							"Access-Control-Request-Headers",
+						),
+					},
+				});
+			} else {
+				// Handle standard OPTIONS request.
+				return new Response(null, {
+					headers: {
+						Allow: "GET, HEAD, POST, OPTIONS",
+					},
+				});
+			}
+		}
 
-/* =========================================================
-   CORS PREFLIGHT
-========================================================= */
-
-export async function OPTIONS() {
-    return new NextResponse(null, {
-        status: 204,
-        headers: corsHeaders(),
-    });
-}
+		const url = new URL(request.url);
+		if (url.pathname.startsWith(PROXY_ENDPOINT)) {
+			if (request.method === "OPTIONS") {
+				// Handle CORS preflight requests
+				return handleOptions(request);
+			} else if (
+				request.method === "GET" ||
+				request.method === "HEAD" ||
+				request.method === "POST"
+			) {
+				// Handle requests to the API server
+				return handleRequest(request);
+			} else {
+				return new Response(null, {
+					status: 405,
+					statusText: "Method Not Allowed",
+				});
+			}
+		} else {
+			return rawHtmlResponse(DEMO_PAGE);
+		}
+	},
+};
